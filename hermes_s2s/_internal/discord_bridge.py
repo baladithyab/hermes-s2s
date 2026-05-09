@@ -1,6 +1,6 @@
 """Discord voice bridge — routes Discord VC audio through a realtime S2S backend.
 
-Strategy (see docs/adrs/0006-discord-voice-bridge.md):
+Strategy (see docs/adrs/0006-discord-voice-bridge.md and 0007-audio-bridge-frame-callback.md):
 
 1. **Native hook (preferred)**: If Hermes ever exposes
    ``ctx.register_voice_pipeline_factory``, we register our pipeline factory
@@ -17,10 +17,36 @@ Strategy (see docs/adrs/0006-discord-voice-bridge.md):
    we log an info line and return. Users who don't opt in get Hermes's default
    STT -> text -> TTS voice path untouched.
 
-The actual PCM<->backend audio loop is a stub in 0.3.0; the value delivered
-in this release is the *setup plumbing* (version gate, monkey-patch site,
-config-driven branch). The audio loop needs a live Hermes + Discord to
-validate and lands in 0.3.1.
+---------------------------------------------------------------------------
+SPIKE — Hermes VoiceReceiver frame-callback availability (ADR-0007)
+---------------------------------------------------------------------------
+Reference: /home/codeseys/.hermes/hermes-agent/gateway/platforms/discord.py
+
+Findings from the VoiceReceiver class (discord.py:128-477):
+
+* **No `set_frame_callback` or any public per-frame hook exists.** The
+  VoiceReceiver pushes decoded PCM into private per-SSRC bytearrays
+  (``self._buffers[ssrc]``, discord.py:157/378) and only surfaces *completed
+  utterances* via ``check_silence()`` (discord.py:414), which is polled on a
+  ~1.5s silence timeout — far too coarse for realtime duplex audio.
+
+* **Decoded PCM appears at discord.py:376** (``pcm = self._decoders[ssrc].decode(decrypted)``)
+  inside the private ``_on_packet`` method (discord.py:250). That is the
+  earliest point 48 kHz/stereo/s16 PCM is available, exactly one Opus frame
+  (~20 ms) at a time, tagged with an ``ssrc`` that maps to a user via
+  ``self._ssrc_to_user`` (discord.py:153).
+
+* **Injection point chosen:** monkey-patch the instance's ``_on_packet``
+  method. We wrap it so the original runs first (NaCl+DAVE decrypt + Opus
+  decode + buffer append), then we diff the ``_buffers[ssrc]`` bytearray to
+  extract just the fresh PCM bytes from this frame and forward
+  ``(user_id, pcm_bytes)`` to our bridge callback. This keeps the existing
+  silence-detection path working (cascaded mode keeps functioning if someone
+  toggles back) and doesn't require re-implementing RTP/DAVE/Opus decode.
+
+* This is a best-effort shim until Hermes exposes a proper
+  ``set_frame_callback`` seam; tracked in the upstream PR linked below.
+---------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -45,6 +71,10 @@ _UPSTREAM_PR_URL = (
 
 # Sentinel so tests (and repeated register() calls) can detect the wrapping.
 _BRIDGE_WRAPPED_MARKER = "__hermes_s2s_voice_bridge__"
+# Marker for the leave_voice_channel wrap so it's idempotent per adapter class.
+_S2S_LEAVE_WRAPPED_MARKER = "__hermes_s2s_leave_wrapped__"
+# Marker on a VoiceReceiver instance so we only install our frame shim once.
+_FRAME_CB_INSTALLED_MARKER = "__hermes_s2s_frame_cb_installed__"
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +105,7 @@ def install_discord_voice_bridge(ctx: Any) -> None:
     # Strategy C — opt-in monkey-patch
     if os.environ.get(_ENV_FLAG) == "1":
         try:
-            _install_via_monkey_patch()
+            _install_via_monkey_patch(ctx)
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("hermes-s2s: Discord voice bridge install failed: %s", exc)
         return
@@ -93,7 +123,7 @@ def install_discord_voice_bridge(ctx: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _install_via_monkey_patch() -> None:
+def _install_via_monkey_patch(ctx: Any = None) -> None:
     """Wrap DiscordAdapter.join_voice_channel to layer on an S2S audio bridge."""
     # Hermes import is deferred to here so the plugin module itself remains
     # importable on hosts that don't have hermes-agent installed.
@@ -137,13 +167,17 @@ def _install_via_monkey_patch() -> None:
         result = await original(self, channel)
         if result:
             try:
-                _install_bridge_on_adapter(self, channel)
+                _install_bridge_on_adapter(self, channel, ctx)
             except Exception as exc:
                 logger.warning("hermes-s2s: voice bridge attach failed: %s", exc)
         return result
 
     setattr(join_voice_channel_wrapped, _BRIDGE_WRAPPED_MARKER, True)
     DiscordAdapter.join_voice_channel = join_voice_channel_wrapped
+
+    # Wrap leave_voice_channel once per adapter class for bridge cleanup.
+    _wrap_leave_voice_channel(DiscordAdapter)
+
     logger.info(
         "hermes-s2s: patched DiscordAdapter.join_voice_channel for realtime bridge"
     )
@@ -196,24 +230,70 @@ def _vtuple(v: str) -> Tuple[int, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Bridge attachment (stub for 0.3.0 — real audio loop lands in 0.3.1)
+# Bridge attachment — resolves adapter/vc/receiver then delegates to _attach_*
 # ---------------------------------------------------------------------------
 
 
-def _install_bridge_on_adapter(adapter: Any, channel: Any) -> None:
-    """Attach a realtime audio bridge on top of an adapter's VoiceClient.
+def _install_bridge_on_adapter(adapter: Any, channel: Any, ctx: Any = None) -> None:
+    """Locate the VoiceClient + VoiceReceiver for ``channel`` and attach a bridge.
 
-    Gated on ``s2s.mode == 'realtime'``. Otherwise leaves Hermes's default
-    STT/TTS path untouched.
-
-    This is a **stub** in 0.3.0: it verifies the gate and logs intent. The
-    actual PCM resample + backend wiring needs a live Hermes + Discord stack
-    to validate end-to-end and is deferred to 0.3.1.
+    Thin wrapper around :func:`_attach_realtime_to_voice_client` that does the
+    adapter-side lookup (``adapter._voice_clients[guild_id]`` + optional
+    ``adapter._voice_receivers[guild_id]``). Kept separate so the real work
+    in ``_attach_realtime_to_voice_client`` is trivially testable in isolation.
     """
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    voice_clients = getattr(adapter, "_voice_clients", {}) or {}
+    voice_receivers = getattr(adapter, "_voice_receivers", {}) or {}
+    vc = voice_clients.get(guild_id) if guild_id is not None else None
+    if vc is None:
+        logger.debug(
+            "hermes-s2s: no VoiceClient on adapter for guild=%s; bridge skipped", guild_id
+        )
+        return
+    receiver = voice_receivers.get(guild_id) if guild_id is not None else None
+    _attach_realtime_to_voice_client(adapter, vc, receiver, ctx)
+
+
+def _attach_realtime_to_voice_client(
+    adapter: Any,
+    voice_client: Any,
+    voice_receiver: Any,
+    ctx: Any,
+) -> None:
+    """Wire a :class:`RealtimeAudioBridge` between the Discord VC and the s2s backend.
+
+    Only runs when ``s2s.mode == 'realtime'``; cascaded mode is a no-op so
+    Hermes's built-in STT->text->TTS path stays untouched.
+
+    Flow (see ADR-0007 + wave-0.3.1 plan B3):
+      1. Load s2s config; bail early if mode != 'realtime'.
+      2. Resolve the realtime backend from the provider registry.
+      3. Build a HermesToolBridge (if ctx exposes ``dispatch_tool``).
+      4. Build a RealtimeAudioBridge wrapping both.
+      5. Install a per-frame PCM callback on the VoiceReceiver (see spike notes
+         at top of this module re: no public hook — we monkey-patch _on_packet).
+      6. Replace whatever the VoiceClient is playing with a QueuedPCMSource fed
+         from the bridge's outbound buffer.
+      7. Schedule ``bridge.start()`` on the voice_client's event loop.
+      8. Track the bridge on ``adapter._s2s_bridges[guild_id]`` for later cleanup.
+    """
+    # Lazy imports — these modules live under _internal/ and depend on the
+    # optional realtime extras; keeping the import here means this module loads
+    # cleanly even if audio_bridge/tool_bridge/discord_audio aren't installable.
     try:
         from ..config import load_config
+        from ..registry import resolve_realtime
+        from .audio_bridge import RealtimeAudioBridge
+        from .tool_bridge import HermesToolBridge
+        from .discord_audio import QueuedPCMSource
+        import asyncio
     except Exception as exc:  # pragma: no cover — defensive
-        logger.warning("hermes-s2s: cannot load s2s config: %s", exc)
+        logger.warning(
+            "hermes-s2s: realtime bridge imports failed (%s); leaving built-in voice in place",
+            exc,
+        )
         return
 
     try:
@@ -230,31 +310,225 @@ def _install_bridge_on_adapter(adapter: Any, channel: Any) -> None:
         )
         return
 
-    guild = getattr(channel, "guild", None)
-    guild_id = getattr(guild, "id", None)
-    voice_clients = getattr(adapter, "_voice_clients", {}) or {}
-    vc = voice_clients.get(guild_id) if guild_id is not None else None
-    if vc is None:
-        logger.debug(
-            "hermes-s2s: no VoiceClient on adapter for guild=%s; bridge skipped", guild_id
+    # (b) Resolve backend
+    try:
+        backend = resolve_realtime(cfg.realtime_provider, cfg.realtime_options)
+    except Exception as exc:
+        logger.warning(
+            "hermes-s2s: failed to resolve realtime backend %r: %s",
+            getattr(cfg, "realtime_provider", "?"),
+            exc,
         )
         return
 
-    # NOTE: do NOT pause Hermes's default VoiceReceiver here. In 0.3.0 the audio
-    # bridge is a no-op stub — pausing the receiver without replacing the audio
-    # loop would silently mute the bot. Hermes's built-in STT -> text -> TTS path
-    # stays active so the user keeps a working voice experience. The receiver
-    # pause + real PCM<->backend wiring lands together in 0.3.1.
-    logger.warning(
-        "hermes-s2s realtime audio bridge is a 0.3.0 stub — audio will NOT route "
-        "through Gemini Live / OpenAI Realtime yet. The Discord bot will continue "
-        "using Hermes built-in voice. Real audio bridging is 0.3.1."
-    )
+    # (c) Tool bridge — only if Hermes ctx exposes dispatch_tool
+    tool_bridge = None
+    if ctx is not None and hasattr(ctx, "dispatch_tool"):
+        try:
+            tool_bridge = HermesToolBridge(dispatch_tool=ctx.dispatch_tool)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("hermes-s2s: tool bridge construction failed: %s", exc)
+            tool_bridge = None
+
+    # (d) Audio bridge
+    bridge = RealtimeAudioBridge(backend=backend, tool_bridge=tool_bridge)
+
+    # (e) Frame callback — see SPIKE notes at top of module re: monkey-patch
+    if voice_receiver is not None:
+        try:
+            _install_frame_callback(voice_receiver, bridge.on_user_frame)
+        except Exception as exc:
+            logger.warning(
+                "hermes-s2s: failed to install frame callback on VoiceReceiver: %s", exc
+            )
+
+    # (f) Outbound audio — route bridge buffer to the VoiceClient
+    try:
+        if voice_client.is_playing():
+            voice_client.stop()
+        voice_client.play(QueuedPCMSource(bridge.buffer))
+    except Exception as exc:
+        logger.warning("hermes-s2s: voice_client.play(QueuedPCMSource) failed: %s", exc)
+
+    # (g) Start the bridge loop on the VC's asyncio loop (thread-safe)
+    try:
+        loop = getattr(voice_client, "loop", None)
+        if loop is not None:
+            asyncio.run_coroutine_threadsafe(bridge.start(), loop)
+        else:  # pragma: no cover — defensive (discord.VoiceClient always has .loop)
+            logger.warning(
+                "hermes-s2s: voice_client.loop is None — cannot start bridge"
+            )
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("hermes-s2s: scheduling bridge.start() failed: %s", exc)
+
+    # (h) Track on adapter for cleanup
+    bridges = getattr(adapter, "_s2s_bridges", None)
+    if bridges is None:
+        bridges = {}
+        try:
+            adapter._s2s_bridges = bridges
+        except Exception:  # pragma: no cover — defensive
+            pass
+    guild = getattr(voice_client, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if guild_id is not None:
+        bridges[guild_id] = bridge
+
     logger.info(
-        "hermes-s2s: realtime bridge configured (guild=%s, backend=%s) — 0.3.1 will "
-        "wire PCM <-> realtime backend; shipped as setup-plumbing-only in 0.3.0",
+        "hermes-s2s: realtime audio bridge attached (guild=%s, backend=%s)",
         guild_id,
-        getattr(cfg, "realtime", None) and getattr(cfg.realtime, "provider", None),
+        getattr(cfg, "realtime_provider", None),
+    )
+
+
+def _install_frame_callback(voice_receiver: Any, callback: Any) -> None:
+    """Route per-Opus-frame decoded PCM from Hermes's VoiceReceiver to ``callback``.
+
+    Preferred path: if the receiver exposes a public ``set_frame_callback``
+    method, use it. (Target state once Hermes ships the upstream seam.)
+
+    Fallback (current state — see spike notes at top of module): monkey-patch
+    the instance's ``_on_packet`` method. We wrap it so the original runs
+    first (RTP/NaCl/DAVE decrypt + Opus decode + buffer append at
+    discord.py:376-378), then compare ``_buffers[ssrc]`` length before/after
+    to extract the PCM bytes this frame just appended, resolve the user_id
+    via ``_ssrc_to_user``, and hand ``(user_id, pcm)`` to our callback.
+
+    Idempotent: marks the receiver with ``_FRAME_CB_INSTALLED_MARKER`` so
+    repeated installs just swap the callback without stacking wrappers.
+    """
+    # Preferred — public hook (once Hermes exposes it).
+    setter = getattr(voice_receiver, "set_frame_callback", None)
+    if callable(setter):
+        setter(callback)
+        logger.info("hermes-s2s: installed frame callback via set_frame_callback()")
+        return
+
+    # Already installed once — just swap the callback slot.
+    if getattr(voice_receiver, _FRAME_CB_INSTALLED_MARKER, False):
+        try:
+            voice_receiver._hermes_s2s_frame_cb = callback
+            logger.debug("hermes-s2s: frame callback swapped in existing shim")
+        except Exception:  # pragma: no cover — defensive
+            pass
+        return
+
+    # Fallback — monkey-patch _on_packet on this instance.
+    original_on_packet = getattr(voice_receiver, "_on_packet", None)
+    if not callable(original_on_packet):
+        logger.warning(
+            "hermes-s2s: VoiceReceiver has neither set_frame_callback nor _on_packet; "
+            "cannot capture decoded PCM frames. %s",
+            _UPSTREAM_PR_URL,
+        )
+        return
+
+    try:
+        voice_receiver._hermes_s2s_frame_cb = callback
+    except Exception:  # pragma: no cover — defensive
+        logger.warning("hermes-s2s: could not attach callback slot on receiver")
+        return
+
+    # Snapshot buffer lengths so the first frame delta is correct even if the
+    # buffers already contain pre-bridge audio.
+    _prev_lens: dict = {}
+
+    def wrapped_on_packet(data: bytes, _orig=original_on_packet, _rcv=voice_receiver) -> None:
+        # Snapshot length per SSRC before the decode, run the original, then
+        # diff to extract just the PCM appended by this packet.
+        buffers = getattr(_rcv, "_buffers", None)
+        before: dict = {}
+        if buffers is not None:
+            try:
+                for ssrc, buf in list(buffers.items()):
+                    before[ssrc] = len(buf)
+            except Exception:  # pragma: no cover — defensive
+                before = {}
+
+        _orig(data)
+
+        cb = getattr(_rcv, "_hermes_s2s_frame_cb", None)
+        if not callable(cb) or buffers is None:
+            return
+        ssrc_map = getattr(_rcv, "_ssrc_to_user", {}) or {}
+        try:
+            for ssrc, buf in list(buffers.items()):
+                prev = before.get(ssrc, _prev_lens.get(ssrc, len(buf)))
+                _prev_lens[ssrc] = len(buf)
+                if len(buf) <= prev:
+                    continue
+                pcm_frame = bytes(buf[prev:])
+                user_id = ssrc_map.get(ssrc, 0) or 0
+                try:
+                    cb(user_id, pcm_frame)
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.debug(
+                        "hermes-s2s: frame callback raised for ssrc=%s: %s", ssrc, exc
+                    )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("hermes-s2s: frame-callback shim error: %s", exc)
+
+    try:
+        voice_receiver._on_packet = wrapped_on_packet  # type: ignore[attr-defined]
+        setattr(voice_receiver, _FRAME_CB_INSTALLED_MARKER, True)
+        logger.warning(
+            "hermes-s2s: VoiceReceiver has no set_frame_callback; installed "
+            "per-frame shim via monkey-patched _on_packet (see ADR-0007)."
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("hermes-s2s: failed to monkey-patch _on_packet: %s", exc)
+
+
+def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
+    """Wrap ``DiscordAdapter.leave_voice_channel`` once to close bridges on leave.
+
+    Idempotent: marks the wrapped method with ``_S2S_LEAVE_WRAPPED_MARKER`` so
+    subsequent calls to :func:`_install_via_monkey_patch` don't double-wrap.
+    """
+    original = getattr(DiscordAdapter, "leave_voice_channel", None)
+    if original is None:
+        logger.debug(
+            "hermes-s2s: DiscordAdapter.leave_voice_channel not found; skipping cleanup wrap"
+        )
+        return
+    if getattr(original, _S2S_LEAVE_WRAPPED_MARKER, False):
+        return
+
+    async def leave_voice_channel_wrapped(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # Figure out which guild we're leaving so we can close the matching bridge.
+        guild_id = None
+        if args:
+            first = args[0]
+            # Common shapes: a guild object, a channel, or a raw id.
+            guild_id = getattr(getattr(first, "guild", None), "id", None)
+            if guild_id is None:
+                guild_id = getattr(first, "id", None)
+            if guild_id is None and isinstance(first, int):
+                guild_id = first
+        bridges = getattr(self, "_s2s_bridges", None) or {}
+        bridge = bridges.pop(guild_id, None) if guild_id is not None else None
+        # Fallback: if we couldn't pinpoint the guild but there's only one
+        # bridge, close it (the common single-guild dev case).
+        if bridge is None and len(bridges) == 1:
+            _, bridge = bridges.popitem()
+        if bridge is not None:
+            try:
+                close = getattr(bridge, "close", None)
+                if callable(close):
+                    res = close()
+                    # close() may be sync or async; await if it's a coroutine.
+                    import inspect
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("hermes-s2s: bridge.close() failed: %s", exc)
+        return await original(self, *args, **kwargs)
+
+    setattr(leave_voice_channel_wrapped, _S2S_LEAVE_WRAPPED_MARKER, True)
+    DiscordAdapter.leave_voice_channel = leave_voice_channel_wrapped
+    logger.debug(
+        "hermes-s2s: patched DiscordAdapter.leave_voice_channel for bridge cleanup"
     )
 
 

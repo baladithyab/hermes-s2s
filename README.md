@@ -103,22 +103,29 @@ Three top-level modes, six provider categories:
 
 ## Status
 
-**0.2.0 (current):** command-provider integration shipping. `hermes-s2s-tts` / `hermes-s2s-stt` console scripts wire into Hermes voice mode via the built-in `type: command` TTS provider and the `HERMES_LOCAL_STT_COMMAND` env var — **no Hermes fork required**, config-only on the Hermes side. See [ADR-0004](docs/adrs/0004-command-provider-interception.md) for why this beats the original "register tools with the same name" sketch.
+**0.3.1 (current):** realtime audio actually flows through Discord. With `HERMES_S2S_MONKEYPATCH_DISCORD=1` + `s2s.mode: realtime`, `/voice join` bridges a Discord VC end-to-end through Gemini Live or OpenAI Realtime — incoming 48 kHz stereo Opus is decoded, resampled, and streamed to the backend; responses come back as 20 ms / 3 840-byte frames into `discord.AudioSource`. Tool calls round-trip through Hermes's dispatcher with 5 s soft / 30 s hard timeouts. See [docs/HOWTO-REALTIME-DISCORD.md](docs/HOWTO-REALTIME-DISCORD.md) to set it up and [scripts/smoke_realtime.py](scripts/smoke_realtime.py) to validate your API keys standalone.
 
 - [x] Project scaffold + plugin manifest
 - [x] Config schema + provider registry interfaces
 - [x] Moonshine STT provider (local) — ported from Hermes feat/aria-voice
 - [x] Kokoro TTS provider (local) — ported from Hermes feat/aria-voice
-- [x] **`hermes-s2s-tts` / `hermes-s2s-stt` CLI shims** (0.2.0)
-- [x] **`hermes s2s setup` interactive wizard** (0.2.0)
-- [x] **`s2s-server` provider (HTTP REST — `/asr`, `/tts`)** (0.2.0)
-- [ ] Daemon mode (`hermes s2s serve --daemon`) — eliminates per-call model-load cost (0.2.1)
-- [ ] `s2s-server` WebSocket pipeline mode (0.3.0)
-- [ ] Realtime backends: Gemini Live, GPT-4o Realtime (0.3.0 — see ADR-0005 / ADR-0006)
-- [ ] Discord voice seam (0.3.0 — see ADR-0006)
+- [x] `hermes-s2s-tts` / `hermes-s2s-stt` CLI shims (0.2.0)
+- [x] `hermes s2s setup` interactive wizard (0.2.0)
+- [x] `s2s-server` provider — HTTP REST (0.2.0), WebSocket pipeline (0.3.0)
+- [x] **Realtime backends: Gemini Live, GPT-4o Realtime wire protocol** (0.3.0)
+- [x] **Discord audio bridge actually moves frames** (0.3.1 — see ADR-0007)
+- [x] **Tool-call bridging with timeouts** (0.3.1 — see ADR-0008)
+- [ ] Multi-user VC mixing (0.4.0)
+- [ ] Per-backend filler-audio impl during slow tool calls (0.3.2)
+- [ ] Daemon mode to eliminate per-call model-load cost (0.3.x)
+- [ ] Telegram realtime duplex (0.4.0)
 - [ ] PyPI publish
 
-> **Known issue (0.2.0):** every voice turn pays the model-load cost because each shim invocation is a fresh Python subprocess. On a 5090 that's ~200–400ms of cold-start overhead per call. The 0.2.1 daemon mode resolves this — see [HOWTO-VOICE-MODE.md §5](docs/HOWTO-VOICE-MODE.md#5-daemon-mode-021-preview).
+> **Known issues in 0.3.1:**
+>
+> - **Single-user only.** Discord's `AudioSink.write` fires per-user-per-frame; 0.3.1 picks the first active speaker and ignores the rest. Multi-party mixing is scoped to 0.4.0.
+> - **Filler audio is a stub.** `send_filler_audio` on both Gemini Live and OpenAI Realtime backends raises `NotImplementedError` — the tool bridge catches it and carries on, so users get longer silent gaps on slow tool calls instead of a "let me check on that" placeholder. Real per-backend filler triggers land in 0.3.2.
+> - **Realtime requires the monkey-patch flag.** `HERMES_S2S_MONKEYPATCH_DISCORD=1` must be set explicitly; without it the bridge is a no-op and Hermes's built-in cascaded voice keeps running (so 0.3.0 users don't regress).
 
 See `docs/ROADMAP.md` for the milestone breakdown.
 

@@ -40,6 +40,7 @@ class RealtimeBackend(Protocol):
     async def send_audio_chunk(self, pcm_chunk: bytes, sample_rate: int) -> None: ...
     async def recv_events(self) -> AsyncIterator[RealtimeEvent]: ...
     async def inject_tool_result(self, call_id: str, result: str) -> None: ...
+    async def send_filler_audio(self, text: str) -> None: ...
     async def interrupt(self) -> None: ...
     async def close(self) -> None: ...
 
@@ -71,6 +72,11 @@ class _BaseRealtimeBackend:
 
     async def inject_tool_result(self, *a: Any, **kw: Any) -> None:
         raise NotImplementedError
+
+    async def send_filler_audio(self, text: str) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}.send_filler_audio not implemented"
+        )
 
     async def interrupt(self) -> None:
         raise NotImplementedError
