@@ -54,11 +54,15 @@ dev = [
 [project.entry-points."hermes_agent.plugins"]
 hermes-s2s = "hermes_s2s"
 
+[project.scripts]
+hermes-s2s-tts = "hermes_s2s.cli_shims.tts_shim:main"
+hermes-s2s-stt = "hermes_s2s.cli_shims.stt_shim:main"
+
 [tool.setuptools]
 packages = ["hermes_s2s", "hermes_s2s.providers", "hermes_s2s.providers.stt",
             "hermes_s2s.providers.tts", "hermes_s2s.providers.realtime",
             "hermes_s2s.providers.pipeline", "hermes_s2s.config",
-            "hermes_s2s.audio", "hermes_s2s._internal"]
+            "hermes_s2s.audio", "hermes_s2s._internal", "hermes_s2s.cli_shims"]
 
 [tool.setuptools.package-data]
 hermes_s2s = ["plugin.yaml", "skills/**/*"]

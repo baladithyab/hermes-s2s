@@ -25,50 +25,46 @@ Forking Hermes for this would diverge the codebase. A plugin opts users in clean
 
 ## Quick start
 
-```bash
-# 1. Install the plugin
-pip install hermes-s2s              # PyPI (once published)
-# or, from source:
-git clone https://github.com/codeseys/hermes-s2s ~/.hermes/plugins/hermes-s2s
-cd ~/.hermes/plugins/hermes-s2s && pip install -e .
+Three steps to get local Moonshine STT + Kokoro TTS flowing through Hermes voice mode:
 
-# 2. Enable it
+```bash
+# 1. Install (with the local-all extra — pulls moonshine_onnx + kokoro)
+pip install "hermes-s2s[local-all]"
+# or, from source:
+git clone https://github.com/baladithyab/hermes-s2s ~/.hermes/plugins/hermes-s2s
+cd ~/.hermes/plugins/hermes-s2s && pip install -e ".[local-all]"
+
+# 2. Enable the plugin in Hermes
 hermes plugins enable hermes-s2s
 
-# 3. Pick a profile (interactive)
+# 3. Pick a profile (interactive wizard — writes the right config for you)
 hermes s2s setup
-# Or edit ~/.hermes/config.yaml directly:
+# tip: `hermes s2s setup --profile local-all --dry-run` to preview the diff
 ```
 
-```yaml
-# ~/.hermes/config.yaml
-s2s:
-  mode: cascaded                # cascaded | realtime | s2s-server
-  pipeline:
-    stt:
-      provider: moonshine       # moonshine | local | groq | openai | mistral | xai | s2s-server
-      moonshine:
-        model: tiny             # tiny (27M) | base (61M)
-        device: cuda            # cuda | cpu
-    tts:
-      provider: kokoro          # kokoro | edge | elevenlabs | openai | piper | neutts | s2s-server
-      kokoro:
-        voice: af_heart
-        lang_code: a            # a (American English), b (British), j (Japanese), z (Chinese), ...
-  realtime:
-    provider: gemini-live       # gemini-live | gpt-realtime | gpt-realtime-mini
-    gemini_live:
-      model: gemini-live-2.5-flash       # half-cascade ($0.06 / 30 min)
-      voice: Aoede
-    openai:
-      model: gpt-realtime-mini           # ($0.45 / 30 min) — or gpt-realtime ($1.44)
-      voice: cedar
-  s2s_server:
-    endpoint: ws://localhost:8000/ws
-    health_url: http://localhost:8000/health
-    auto_launch: false                    # true: hermes spawns the server
-    fallback_to: pipeline                 # if server down, fall through to cascaded
-```
+Then start Hermes normally, enable voice (`/voice on` in CLI, or join a Discord VC with the voice bridge configured), and talk.
+
+> **What this changes in your Hermes config**
+>
+> `hermes s2s setup` doesn't fork Hermes — it writes standard Hermes command-provider entries that invoke the `hermes-s2s-tts` / `hermes-s2s-stt` console scripts shipped by this package. See [ADR-0004](docs/adrs/0004-command-provider-interception.md) for the integration rationale.
+>
+> ```yaml
+> # ~/.hermes/config.yaml (excerpt, written by `hermes s2s setup`)
+> tts:
+>   provider: hermes-s2s-kokoro
+>   providers:
+>     hermes-s2s-kokoro:
+>       type: command
+>       command: "hermes-s2s-tts --provider kokoro --voice af_heart --output {output_path} --text-file {input_path}"
+>       output_format: wav
+> ```
+>
+> ```bash
+> # ~/.hermes/.env (appended by `hermes s2s setup`)
+> HERMES_LOCAL_STT_COMMAND='hermes-s2s-stt --provider moonshine --model tiny --input {input_path} --output {output_path}'
+> ```
+
+For the full mechanics of each path, worked examples, and troubleshooting, see [docs/HOWTO-VOICE-MODE.md](docs/HOWTO-VOICE-MODE.md).
 
 ## Architecture
 
@@ -107,20 +103,24 @@ Three top-level modes, six provider categories:
 
 ## Status
 
+**0.2.0 (current):** command-provider integration shipping. `hermes-s2s-tts` / `hermes-s2s-stt` console scripts wire into Hermes voice mode via the built-in `type: command` TTS provider and the `HERMES_LOCAL_STT_COMMAND` env var — **no Hermes fork required**, config-only on the Hermes side. See [ADR-0004](docs/adrs/0004-command-provider-interception.md) for why this beats the original "register tools with the same name" sketch.
+
 - [x] Project scaffold + plugin manifest
 - [x] Config schema + provider registry interfaces
 - [x] Moonshine STT provider (local) — ported from Hermes feat/aria-voice
 - [x] Kokoro TTS provider (local) — ported from Hermes feat/aria-voice
-- [ ] s2s-server backend (WS client for `streaming-speech-to-speech`)
-- [ ] realtime-gemini backend
-- [ ] realtime-openai backend
-- [ ] Discord voice integration (bridge into Hermes's Discord adapter)
-- [ ] CLI voice integration
-- [ ] `/s2s mode` slash command
-- [ ] `hermes s2s` CLI subcommand tree
+- [x] **`hermes-s2s-tts` / `hermes-s2s-stt` CLI shims** (0.2.0)
+- [x] **`hermes s2s setup` interactive wizard** (0.2.0)
+- [x] **`s2s-server` provider (HTTP REST — `/asr`, `/tts`)** (0.2.0)
+- [ ] Daemon mode (`hermes s2s serve --daemon`) — eliminates per-call model-load cost (0.2.1)
+- [ ] `s2s-server` WebSocket pipeline mode (0.3.0)
+- [ ] Realtime backends: Gemini Live, GPT-4o Realtime (0.3.0 — see ADR-0005 / ADR-0006)
+- [ ] Discord voice seam (0.3.0 — see ADR-0006)
 - [ ] PyPI publish
 
-See `docs/ROADMAP.md` for milestone breakdown.
+> **Known issue (0.2.0):** every voice turn pays the model-load cost because each shim invocation is a fresh Python subprocess. On a 5090 that's ~200–400ms of cold-start overhead per call. The 0.2.1 daemon mode resolves this — see [HOWTO-VOICE-MODE.md §5](docs/HOWTO-VOICE-MODE.md#5-daemon-mode-021-preview).
+
+See `docs/ROADMAP.md` for the milestone breakdown.
 
 ## Compatibility
 
