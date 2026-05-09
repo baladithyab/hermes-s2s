@@ -93,13 +93,14 @@ def test_set_mode_accepts_valid():
     assert out["session_mode"] == "realtime"
 
 
-def test_realtime_stub_raises_helpful_error():
-    """Realtime backends are stubs in 0.1.0 — they should fail noisily, not silently."""
+def test_realtime_backend_requires_api_key(monkeypatch):
+    """Gemini Live backend should fail loudly when no API key is configured."""
     import asyncio
     from hermes_s2s.providers.realtime.gemini_live import make_gemini_live
 
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     backend = make_gemini_live({})
-    with pytest.raises(NotImplementedError, match="stub"):
-        asyncio.get_event_loop().run_until_complete(
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        asyncio.new_event_loop().run_until_complete(
             backend.connect("system prompt", "Aoede", [])
         )

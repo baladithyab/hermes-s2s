@@ -107,4 +107,9 @@ def register(ctx: Any) -> None:
     except Exception as exc:
         logger.debug("Skill registration skipped: %s", exc)
 
+    # Discord voice bridge (no-op unless HERMES_S2S_MONKEYPATCH_DISCORD=1 or
+    # ctx exposes a native voice-pipeline hook). See ADR-0006.
+    from ._internal.discord_bridge import install_discord_voice_bridge
+    install_discord_voice_bridge(ctx)
+
     logger.info("hermes-s2s plugin v%s registered", __version__)
