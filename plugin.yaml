@@ -9,6 +9,7 @@ provides_tools:
   - s2s_status
   - s2s_set_mode
   - s2s_test_pipeline
+  - s2s_doctor
 
 provides_hooks:
   - on_session_start

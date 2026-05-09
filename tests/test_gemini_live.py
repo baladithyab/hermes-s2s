@@ -235,3 +235,42 @@ async def test_translate_tools_shape():
         }
     ]
     assert _translate_tools([]) == []
+
+
+# -------------------------------------------------------------------- #
+# 5. send_filler_audio emits a clientContent text turn                 #
+# -------------------------------------------------------------------- #
+async def test_send_filler_audio_emits_text_content(mock_ws_server):
+    """Verify the G1 filler-audio frame shape per Gemini Live live-api docs.
+
+    Shape:
+        {"clientContent": {"turns": [{"role": "user",
+                                      "parts": [{"text": "hello world"}]}],
+                           "turnComplete": true}}
+    """
+    server = await mock_ws_server()
+    server.add_reply({"setupComplete": {}})
+
+    backend = GeminiLiveBackend(url=server.url)
+    await backend.connect("sys", "Aoede", [])
+
+    # Drain the setup frame.
+    await server.wait_for_messages(1, timeout=2.0)
+
+    await backend.send_filler_audio("hello world")
+
+    await server.wait_for_messages(2, timeout=2.0)
+    filler = json.loads(server.sent_messages[1])
+
+    assert "clientContent" in filler, filler
+    cc = filler["clientContent"]
+    assert cc["turnComplete"] is True
+    turns = cc["turns"]
+    assert len(turns) == 1
+    assert turns[0]["role"] == "user"
+    assert turns[0]["parts"][0]["text"] == "hello world"
+
+    # Not-connected guard: close → raises RuntimeError.
+    await backend.close()
+    with pytest.raises(RuntimeError):
+        await backend.send_filler_audio("ignored")

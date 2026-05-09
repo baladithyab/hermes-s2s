@@ -300,6 +300,31 @@ class OpenAIRealtimeBackend:
         )
         await self._send_json({"type": "response.create"})
 
+    async def send_filler_audio(self, text: str) -> None:
+        """Make the model speak a short filler line once before resuming.
+
+        Sends a `response.create` event with an `instructions` override and
+        `modalities: ["audio"]`. Per the OpenAI Realtime docs, `response.create`
+        lets the client spawn an out-of-band model response; the `instructions`
+        field on `response` overrides the session prompt just for this
+        response. Pattern borrowed from Pipecat (see ADR-0008 §2) — no
+        pre-synthesis, voice matches the rest of the session.
+
+        Fire-and-forget: does not await any server response. If not connected
+        raises RuntimeError consistent with the other send helpers.
+        """
+        if self._ws is None:
+            raise RuntimeError("OpenAIRealtimeBackend: not connected")
+        await self._send_json(
+            {
+                "type": "response.create",
+                "response": {
+                    "instructions": f"Briefly say: {text}",
+                    "modalities": ["audio"],
+                },
+            }
+        )
+
     async def interrupt(self, item_id: str = "", audio_end_ms: int = 0) -> None:
         """Cancel the in-flight response, clear queued audio, truncate transcript."""
         if self._ws is None:

@@ -23,26 +23,30 @@ Hermes built-in voice mode is great for the common case. This plugin is for powe
 
 Forking Hermes for this would diverge the codebase. A plugin opts users in cleanly.
 
-## Quick start
-
-Three steps to get local Moonshine STT + Kokoro TTS flowing through Hermes voice mode:
+## 30-second install
 
 ```bash
-# 1. Install (with the local-all extra — pulls moonshine_onnx + kokoro)
-pip install "hermes-s2s[local-all]"
-# or, from source:
-git clone https://github.com/baladithyab/hermes-s2s ~/.hermes/plugins/hermes-s2s
-cd ~/.hermes/plugins/hermes-s2s && pip install -e ".[local-all]"
-
-# 2. Enable the plugin in Hermes
+pip install 'hermes-s2s[all]'
 hermes plugins enable hermes-s2s
-
-# 3. Pick a profile (interactive wizard — writes the right config for you)
-hermes s2s setup
-# tip: `hermes s2s setup --profile local-all --dry-run` to preview the diff
+hermes s2s setup --profile realtime-gemini
+hermes s2s doctor
 ```
 
-Then start Hermes normally, enable voice (`/voice on` in CLI, or join a Discord VC with the voice bridge configured), and talk.
+The doctor command tells you what's missing (API keys, system deps).
+Once it's all green, restart `hermes gateway` and `/voice join` in any
+Discord VC the bot has access to.
+
+### Other profiles
+
+| Profile | What you get | $/30min |
+|---|---|---|
+| realtime-gemini | Gemini Live half-cascade | $0.06 |
+| realtime-openai | gpt-realtime premium | $1.44 |
+| realtime-openai-mini | gpt-realtime-mini | $0.45 |
+| local-all | Moonshine + Kokoro (cascaded) | electricity only |
+
+Full profile matrix + per-OS system deps: [docs/INSTALL.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/INSTALL.md).
+End-to-end voice-mode walkthrough + troubleshooting: [docs/HOWTO-VOICE-MODE.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/HOWTO-VOICE-MODE.md).
 
 > **What this changes in your Hermes config**
 >
@@ -103,7 +107,9 @@ Three top-level modes, six provider categories:
 
 ## Status
 
-**0.3.1 (current):** realtime audio actually flows through Discord. With `HERMES_S2S_MONKEYPATCH_DISCORD=1` + `s2s.mode: realtime`, `/voice join` bridges a Discord VC end-to-end through Gemini Live or OpenAI Realtime — incoming 48 kHz stereo Opus is decoded, resampled, and streamed to the backend; responses come back as 20 ms / 3 840-byte frames into `discord.AudioSource`. Tool calls round-trip through Hermes's dispatcher with 5 s soft / 30 s hard timeouts. See [docs/HOWTO-REALTIME-DISCORD.md](docs/HOWTO-REALTIME-DISCORD.md) to set it up and [scripts/smoke_realtime.py](scripts/smoke_realtime.py) to validate your API keys standalone.
+**0.3.2 (current):** plug-and-play install + `hermes s2s doctor` diagnostic + backend filler audio. `hermes s2s setup --profile realtime-gemini` writes the full realtime config + monkey-patch flag in one shot; `hermes s2s doctor` runs a readiness check over config, Python deps, system deps, API keys, and an optional backend-WS probe. Backend filler audio (`send_filler_audio`) now lands for both Gemini Live and OpenAI Realtime so slow tool calls no longer produce dead air. See [docs/INSTALL.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/INSTALL.md) for the install profile matrix and [docs/HOWTO-VOICE-MODE.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/HOWTO-VOICE-MODE.md#diagnosing-problems-with-hermes-s2s-doctor) for the doctor walkthrough.
+
+**0.3.1:** realtime audio actually flows through Discord. With `HERMES_S2S_MONKEYPATCH_DISCORD=1` + `s2s.mode: realtime`, `/voice join` bridges a Discord VC end-to-end through Gemini Live or OpenAI Realtime — incoming 48 kHz stereo Opus is decoded, resampled, and streamed to the backend; responses come back as 20 ms / 3 840-byte frames into `discord.AudioSource`. Tool calls round-trip through Hermes's dispatcher with 5 s soft / 30 s hard timeouts. See [docs/HOWTO-REALTIME-DISCORD.md](docs/HOWTO-REALTIME-DISCORD.md) to set it up and [scripts/smoke_realtime.py](scripts/smoke_realtime.py) to validate your API keys standalone.
 
 - [x] Project scaffold + plugin manifest
 - [x] Config schema + provider registry interfaces
@@ -115,17 +121,19 @@ Three top-level modes, six provider categories:
 - [x] **Realtime backends: Gemini Live, GPT-4o Realtime wire protocol** (0.3.0)
 - [x] **Discord audio bridge actually moves frames** (0.3.1 — see ADR-0007)
 - [x] **Tool-call bridging with timeouts** (0.3.1 — see ADR-0008)
+- [x] **Plug-and-play install + `hermes s2s doctor`** (0.3.2 — see ADR-0009)
+- [x] **Per-backend filler-audio implementation** (0.3.2)
 - [ ] Multi-user VC mixing (0.4.0)
-- [ ] Per-backend filler-audio impl during slow tool calls (0.3.2)
+- [ ] Filler-audio cancellation when the tool result arrives early (0.4.0)
 - [ ] Daemon mode to eliminate per-call model-load cost (0.3.x)
 - [ ] Telegram realtime duplex (0.4.0)
 - [ ] PyPI publish
 
-> **Known issues in 0.3.1:**
+> **Known issues in 0.3.2:**
 >
-> - **Single-user only.** Discord's `AudioSink.write` fires per-user-per-frame; 0.3.1 picks the first active speaker and ignores the rest. Multi-party mixing is scoped to 0.4.0.
-> - **Filler audio is a stub.** `send_filler_audio` on both Gemini Live and OpenAI Realtime backends raises `NotImplementedError` — the tool bridge catches it and carries on, so users get longer silent gaps on slow tool calls instead of a "let me check on that" placeholder. Real per-backend filler triggers land in 0.3.2.
-> - **Realtime requires the monkey-patch flag.** `HERMES_S2S_MONKEYPATCH_DISCORD=1` must be set explicitly; without it the bridge is a no-op and Hermes's built-in cascaded voice keeps running (so 0.3.0 users don't regress).
+> - **Single-user only.** Discord's `AudioSink.write` fires per-user-per-frame; the bridge picks the first active speaker and ignores the rest. Multi-party mixing is scoped to 0.4.0.
+> - **Filler audio is fire-and-forget.** `send_filler_audio("let me check on that")` now plays, but if the tool result lands mid-phrase, the filler is NOT interrupted — you'll hear both. Cancellation is scoped to 0.4.0.
+> - **Realtime requires the monkey-patch flag.** `HERMES_S2S_MONKEYPATCH_DISCORD=1` must be set explicitly; the `realtime-*` setup profiles append this automatically, but if you're editing `.env` by hand you still need the line.
 
 See `docs/ROADMAP.md` for the milestone breakdown.
 

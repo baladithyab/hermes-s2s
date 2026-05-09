@@ -21,7 +21,17 @@ from . import tools as s2s_tools
 # Profile definitions (tts + stt config blocks per ADR-0004)
 # ---------------------------------------------------------------------------
 
-_PROFILES = ["local-all", "hybrid-privacy", "cloud-cheap", "s2s-server", "custom"]
+_PROFILES = [
+    "local-all",
+    "hybrid-privacy",
+    "cloud-cheap",
+    "s2s-server",
+    "realtime-gemini",
+    "realtime-openai",
+    "realtime-openai-mini",
+    "custom",
+]
+_REALTIME_PROFILES = {"realtime-gemini", "realtime-openai", "realtime-openai-mini"}
 
 _LOCAL_STT_COMMAND = (
     "hermes-s2s-stt --provider moonshine --model tiny "
@@ -32,6 +42,90 @@ _S2S_STT_COMMAND = (
     "--output {output_path} --input {input_path}"
 )
 _ENV_MARKER = "# hermes-s2s setup: HERMES_LOCAL_STT_COMMAND"
+_MONKEYPATCH_MARKER = "# hermes-s2s setup: HERMES_S2S_MONKEYPATCH_DISCORD"
+_MONKEYPATCH_LINE = "HERMES_S2S_MONKEYPATCH_DISCORD=1"
+
+
+def _realtime_s2s_block(profile: str) -> dict:
+    """Return the full s2s.{mode,realtime} config block for a realtime profile."""
+    if profile == "realtime-gemini":
+        return {
+            "mode": "realtime",
+            "realtime": {
+                "provider": "gemini-live",
+                "gemini_live": {
+                    "model": "gemini-live-2.5-flash",
+                    "voice": "Aoede",
+                    "system_prompt": "You are a helpful voice assistant. Respond briefly.",
+                },
+            },
+        }
+    if profile == "realtime-openai":
+        return {
+            "mode": "realtime",
+            "realtime": {
+                "provider": "gpt-realtime",
+                "openai": {
+                    "model": "gpt-realtime",
+                    "voice": "alloy",
+                    "system_prompt": "You are a helpful voice assistant. Respond briefly.",
+                },
+            },
+        }
+    if profile == "realtime-openai-mini":
+        return {
+            "mode": "realtime",
+            "realtime": {
+                "provider": "gpt-realtime-mini",
+                "openai": {
+                    "model": "gpt-realtime-mini",
+                    "voice": "alloy",
+                    "system_prompt": "You are a helpful voice assistant. Respond briefly.",
+                },
+            },
+        }
+    raise ValueError(f"unknown realtime profile: {profile}")
+
+
+def _print_realtime_checklist(profile: str) -> None:
+    """Print pre-write readiness checklist for realtime profiles (stdout)."""
+    def _mark(ok: bool) -> str:
+        return "[\u2713]" if ok else "[\u2717]"
+
+    print("Realtime mode readiness check:")
+    if "gemini" in profile:
+        ok = bool(os.environ.get("GEMINI_API_KEY"))
+        print(f"  {_mark(ok)} GEMINI_API_KEY — https://aistudio.google.com/apikey")
+    if "openai" in profile:
+        ok = bool(os.environ.get("OPENAI_API_KEY"))
+        print(f"  {_mark(ok)} OPENAI_API_KEY — https://platform.openai.com/api-keys")
+    discord_docs = (
+        "see https://hermes-agent.nousresearch.com/docs/user-guide/messaging/discord"
+    )
+    ok_tok = bool(os.environ.get("DISCORD_BOT_TOKEN"))
+    print(f"  {_mark(ok_tok)} DISCORD_BOT_TOKEN — {discord_docs}")
+    ok_users = bool(os.environ.get("DISCORD_ALLOWED_USERS"))
+    print(f"  {_mark(ok_users)} DISCORD_ALLOWED_USERS — {discord_docs}")
+    ok_discord = importlib.util.find_spec("discord") is not None
+    print(
+        f"  {_mark(ok_discord)} python 'import discord' — "
+        "pip install hermes-agent[messaging]"
+    )
+
+
+def _append_monkeypatch_env(env_path: Path) -> bool:
+    """Append HERMES_S2S_MONKEYPATCH_DISCORD=1 to .env idempotently.
+
+    Mirrors _write_env_command's marker-line pattern. Returns True if written.
+    """
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = env_path.read_text() if env_path.exists() else ""
+    if _MONKEYPATCH_MARKER in existing or _MONKEYPATCH_LINE in existing:
+        return False
+    line = f"\n{_MONKEYPATCH_MARKER}\n{_MONKEYPATCH_LINE}\n"
+    with env_path.open("a") as f:
+        f.write(line)
+    return True
 
 
 def _profile_blocks(profile: str) -> tuple[dict, dict, str | None]:
@@ -189,6 +283,19 @@ def setup_argparse(subparser: argparse.ArgumentParser) -> None:
         default=None,
         help="Path to config.yaml (default: ~/.hermes/config.yaml)",
     )
+    # ----- G3 (ADR-0009 §2): doctor subcommand ----------------------------
+    p_doctor = subs.add_parser(
+        "doctor", help="Pre-flight readiness check for hermes-s2s voice setup"
+    )
+    p_doctor.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    p_doctor.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Skip backend WS connectivity probe",
+    )
+    # ----- end G3 ---------------------------------------------------------
     subparser.set_defaults(func=dispatch)
 
 
@@ -205,10 +312,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"Invalid choice; defaulting to {_PROFILES[0]}", file=sys.stderr)
             profile = _PROFILES[0]
 
-    if profile == "custom":
+    is_realtime = profile in _REALTIME_PROFILES
+
+    if is_realtime:
+        s2s_block = _realtime_s2s_block(profile)
+        tts_block = None
+        stt_block = None
+        stt_env_cmd = None
+    elif profile == "custom":
         tts_block, stt_block, stt_env_cmd = _custom_prompt()
+        s2s_block = None
     else:
         tts_block, stt_block, stt_env_cmd = _profile_blocks(profile)
+        s2s_block = None
 
     missing = _detect_missing(profile)
     if missing:
@@ -217,13 +333,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"  - {m}", file=sys.stderr)
         print("(You can install them later; setup will proceed.)", file=sys.stderr)
 
-    new_config = {"tts": tts_block, "stt": stt_block}
+    if is_realtime:
+        _print_realtime_checklist(profile)
+        new_config: dict[str, Any] = {"s2s": s2s_block}
+    else:
+        new_config = {"tts": tts_block, "stt": stt_block}
 
     if args.dry_run:
         print("# dry-run: config that would be merged into config.yaml")
         print(yaml.safe_dump(new_config, sort_keys=False))
         if stt_env_cmd:
             print(f"# .env: HERMES_LOCAL_STT_COMMAND={shlex.quote(stt_env_cmd)}")
+        if is_realtime:
+            print(f"# .env: {_MONKEYPATCH_LINE}")
         return 0
 
     cfg_path = Path(args.config_path) if args.config_path else Path.home() / ".hermes" / "config.yaml"
@@ -244,6 +366,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         else:
             print(f"HERMES_LOCAL_STT_COMMAND already present in {env_path}")
 
+    if is_realtime:
+        env_path = cfg_path.parent / ".env"
+        if _append_monkeypatch_env(env_path):
+            print(f"Appended {_MONKEYPATCH_LINE} to {env_path}")
+        else:
+            print(f"{_MONKEYPATCH_LINE} already present in {env_path}")
+
     print("\nNext steps:")
     print("  1. Restart Hermes so it picks up the new config.")
     print("  2. In Hermes: /voice on")
@@ -257,6 +386,11 @@ def dispatch(args: argparse.Namespace) -> None:
     if sub == "setup":
         cmd_setup(args)
         return
+    # ----- G3 (ADR-0009 §2): doctor subcommand dispatch -------------------
+    if sub == "doctor":
+        cmd_doctor(args)
+        return
+    # ----- end G3 ---------------------------------------------------------
     if sub == "mode":
         result = s2s_tools.s2s_set_mode({"mode": args.mode})
     elif sub == "test":
@@ -268,3 +402,17 @@ def dispatch(args: argparse.Namespace) -> None:
         print(json.dumps(parsed, indent=2))
     except Exception:
         print(result)
+
+
+# ----- G3 (ADR-0009 §2): doctor subcommand handler ------------------------
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run the pre-flight readiness check; exit 1 on any failing check."""
+    from .doctor import run_doctor, format_human, format_json
+
+    report = run_doctor(probe=not args.no_probe)
+    if args.json:
+        print(format_json(report))
+    else:
+        print(format_human(report))
+    sys.exit(0 if report["overall_status"] != "fail" else 1)
+# ----- end G3 -------------------------------------------------------------

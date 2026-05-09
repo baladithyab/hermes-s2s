@@ -21,7 +21,7 @@ from .registry import (
     resolve_tts,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __all__ = [
     "S2SConfig",
     "load_config",
@@ -77,6 +77,12 @@ def register(ctx: Any) -> None:
         toolset="s2s",
         schema=s2s_schemas.S2S_TEST_PIPELINE,
         handler=s2s_tools.s2s_test_pipeline,
+    )
+    ctx.register_tool(
+        name="s2s_doctor",
+        toolset="s2s",
+        schema=s2s_schemas.S2S_DOCTOR,
+        handler=s2s_tools.s2s_doctor,
     )
 
     # Slash command — works in CLI and gateway

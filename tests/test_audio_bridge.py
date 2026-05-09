@@ -354,3 +354,61 @@ def test_on_user_frame_thread_safe() -> None:
         assert errors == [], f"thread errors: {errors}"
 
     asyncio.run(scenario())
+
+
+# ---------- G3 (BACKLOG-0.3.2 F5): stats + debounced warn logs ----------
+
+
+def test_buffer_logs_warning_every_100_drops(caplog: Any) -> None:
+    """push_input more than 200 overflows -> WARNING logged at 100 + 200."""
+    import logging
+
+    buf = BridgeBuffer(input_max=1)
+    caplog.set_level(logging.WARNING, logger="hermes_s2s._internal.audio_bridge")
+    for i in range(250):
+        buf.push_input(user_id=i, pcm=b"\x00" * 2)
+    warn_msgs = [
+        r.message for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    # input_max=1 + 250 pushes: each overflow drops one, so the first push is
+    # accepted and subsequent 249 trigger drops. We expect warns at 100 and 200.
+    assert len(warn_msgs) >= 2, f"expected at least 2 warnings, got {warn_msgs}"
+    assert any("100 input frames dropped" in m for m in warn_msgs), warn_msgs
+    assert any("200 input frames dropped" in m for m in warn_msgs), warn_msgs
+
+
+def test_buffer_stats_returns_expected_keys() -> None:
+    buf = BridgeBuffer()
+    s = buf.stats()
+    assert set(s.keys()) == {
+        "dropped_input",
+        "dropped_output",
+        "queue_depth_in",
+        "queue_depth_out",
+        "frames_emitted",
+        "frames_underflow",
+    }
+    # Initially all zero.
+    assert all(v == 0 for v in s.values())
+    # After an underflow read:
+    _ = buf.read_frame()
+    s2 = buf.stats()
+    assert s2["frames_underflow"] == 1
+
+
+def test_bridge_stats_aggregates() -> None:
+    backend = _make_backend()
+    bridge = RealtimeAudioBridge(backend=backend)
+    s = bridge.stats()
+    for k in (
+        "dropped_input",
+        "dropped_output",
+        "queue_depth_in",
+        "queue_depth_out",
+        "frames_emitted",
+        "frames_underflow",
+    ):
+        assert k in s, f"missing buffer-stat key {k!r} in bridge.stats()"
+    # Bridge-level augmentation present.
+    assert "backend_input_rate" in s
+    assert "backend_output_rate" in s

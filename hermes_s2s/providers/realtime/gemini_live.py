@@ -376,6 +376,30 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
         }
         await self._ws.send(json.dumps(msg))
 
+    async def send_filler_audio(self, text: str) -> None:
+        """Make the model speak `text` once before resuming.
+
+        Sends a `BidiGenerateContentClientContent` frame with a single user
+        turn and `turnComplete: true`. Per the Gemini Live `live-api` docs,
+        this injects a one-shot turn the model reads aloud using the current
+        voice/language configuration, then continues with whatever it was
+        doing. Used by HermesToolBridge on soft-timeout (ADR-0008 §2) to
+        avoid long silent gaps while a tool is running.
+
+        Fire-and-forget: does not await any server response. If not connected
+        raises RuntimeError consistent with `send_audio_chunk` /
+        `inject_tool_result`.
+        """
+        if self._ws is None:
+            raise RuntimeError(f"{self.NAME}: not connected")
+        msg = {
+            "clientContent": {
+                "turns": [{"role": "user", "parts": [{"text": text}]}],
+                "turnComplete": True,
+            }
+        }
+        await self._ws.send(json.dumps(msg))
+
     async def interrupt(self) -> None:
         """Manual interrupt — send activityStart/activityEnd bracket.
 

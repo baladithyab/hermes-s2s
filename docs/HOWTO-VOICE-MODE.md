@@ -76,6 +76,107 @@ cat /tmp/out.txt
 
 **"I'm using a non-Hermes-compatible STT / TTS and want to plug it in."** Point `HERMES_LOCAL_STT_COMMAND` / `tts.providers.<name>.command` at your own script. The shims are not magic — any command that honors the `{input_path}` / `{output_path}` contract works. The `hermes-s2s-*` shims are just a pre-packaged, tested path for the local stack.
 
+## 4.5. Diagnosing problems with `hermes s2s doctor`
+
+Added in 0.3.2. A single command that walks every layer of the stack —
+config file, Python deps, system deps, API keys, Hermes integration, and an
+optional live WS probe to the configured realtime backend — and tells you
+exactly what's missing, with a copy-pastable fix.
+
+```
+$ hermes s2s doctor
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+hermes-s2s 0.3.2 — readiness check
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Configuration:
+  ✓ s2s.mode = realtime
+  ✓ s2s.realtime.provider = gemini-live
+
+Python dependencies:
+  ✓ websockets        installed
+  ✓ scipy             installed
+  ✗ kokoro            NOT installed   →  pip install hermes-s2s[kokoro]
+
+System dependencies:
+  ✓ ffmpeg            in PATH
+  ✓ libopus           found
+  ⚠ espeak-ng         not found       →  needed for kokoro; sudo apt install espeak-ng
+
+API keys:
+  ✓ GEMINI_API_KEY    set (39 chars)
+  ⚠ OPENAI_API_KEY    not set         →  optional; needed if you switch to openai-realtime
+
+Hermes integration:
+  ✓ HERMES_S2S_MONKEYPATCH_DISCORD = 1
+  ✓ DISCORD_BOT_TOKEN              set
+  ✓ DISCORD_ALLOWED_USERS          set (1 user)
+
+Backend connectivity:
+  ⏳ Probing Gemini Live ws://...     ✓ connected and responsive (412ms)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Overall: 1 warning, 1 error.
+Required for realtime+Discord to work: install kokoro (warning above is optional).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Reading each category
+
+**Configuration.** The doctor loads your `~/.hermes/config.yaml` and checks
+that `s2s.mode` is one of `cascaded | realtime | s2s-server`, and that the
+matching provider block exists. If you see `✗ s2s.mode missing`, run
+`hermes s2s setup --profile <something>` — the wizard writes a full block.
+
+**Python dependencies.** Imports each required module. `✗ kokoro NOT
+installed` means you picked a cascaded profile that uses Kokoro TTS but
+didn't install the `[kokoro]` extra; follow the inline remediation.
+Realtime-only setups don't need Moonshine or Kokoro — the doctor understands
+your mode and only flags what your config actually needs.
+
+**System dependencies.** Shells out to find `ffmpeg`, `libopus` (via
+`ldconfig -p` on Linux / `dpkg`/`brew` where relevant), and `espeak-ng`.
+See [INSTALL.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/INSTALL.md#system-dependencies)
+for per-OS install commands.
+
+**API keys.** Checks presence AND plausible length. An API key that's set
+to the literal string `"YOUR_KEY_HERE"` fails the length heuristic with a
+helpful warning. Keys aren't logged — only their length is reported.
+
+**Hermes integration.** The realtime bridge is a monkey-patch over
+discord.py's `AudioSink`, opt-in via `HERMES_S2S_MONKEYPATCH_DISCORD=1`.
+The doctor checks that flag + the Discord bot credentials that Hermes
+itself needs. If the flag is missing but you picked a realtime mode, this
+fails loud — it's the #1 "installed everything but voice is silent" cause.
+
+**Backend connectivity.** Opens a 5 s WebSocket probe to the configured
+realtime backend (Gemini Live or OpenAI Realtime), waits for the first
+server event, closes. Skipped with `--no-probe`. The probe costs ~$0.0001
+per run (one billable session open). If this fails, the error message
+contains the raw WebSocket response — usually a 401 (bad key) or a 403
+(key lacks realtime scope).
+
+### Remediation walkthrough
+
+1. Run `hermes s2s doctor`. Every red `✗` is a blocker; yellow `⚠` is
+   "this works but you should know".
+2. Walk top to bottom — earlier checks block later ones (no point probing
+   the backend if the API key is missing).
+3. Apply the one-line remediation printed next to each check.
+4. Re-run `hermes s2s doctor`. Iterate until all-green.
+5. Restart `hermes gateway` (env vars are only re-read on process start)
+   and `/voice join` in Discord.
+
+### CI + LLM use
+
+- `hermes s2s doctor --json` emits the same report as structured JSON for
+  scripts and CI pipelines. Exit code is 0 on all-green, 1 otherwise.
+- `hermes s2s doctor --no-probe` skips the WS probe. Use this in CI to
+  avoid per-run charges, and on laptops offline.
+- The LLM can also run the doctor directly via the `s2s_doctor` tool —
+  just ask Hermes "is my voice setup working?" and it will invoke the
+  tool, read the JSON, and explain the remediation in plain English.
+
 ## 5. Daemon mode (0.2.1 preview)
 
 The per-call model-load cost is the only real wart of the 0.2.0 design. ADR-0004 already specifies the fix: a long-lived daemon that loads Moonshine and Kokoro once and serves subsequent calls over a Unix domain socket.

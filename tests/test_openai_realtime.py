@@ -287,3 +287,46 @@ async def test_interrupt_sends_cancel_clear_truncate(mock_ws_server):
     assert trunc_msg["content_index"] == 0
 
     await backend.close()
+
+
+async def test_send_filler_audio_emits_response_create(mock_ws_server):
+    """e. send_filler_audio must emit a `response.create` with instructions
+    override and audio modality. Shape per OpenAI Realtime docs:
+
+        {"type": "response.create",
+         "response": {"instructions": "Briefly say: thinking",
+                      "modalities": ["audio"]}}
+
+    Used by HermesToolBridge on soft-timeout (ADR-0008 §2).
+    """
+    # Scripted mode (no handler) — we only observe client frames.
+    server = await mock_ws_server()
+
+    backend = OpenAIRealtimeBackend(
+        connect_url=server.url, api_key="sk-test", model="gpt-realtime"
+    )
+    await backend.connect(system_prompt="sys", voice="alloy", tools=[])
+
+    # 1 frame so far (session.update from connect).
+    await server.wait_for_messages(1, timeout=2.0)
+
+    await backend.send_filler_audio("thinking")
+
+    # session.update + response.create == 2 messages.
+    await server.wait_for_messages(2, timeout=2.0)
+
+    types = [m.get("type") for m in server.received]
+    assert "response.create" in types, types
+
+    rc_idx = types.index("response.create")
+    rc = server.received[rc_idx]
+
+    # Session.update from connect() must still come first and be untouched.
+    assert server.received[0]["type"] == "session.update"
+    assert rc_idx > 0
+
+    response = rc.get("response") or {}
+    assert response.get("modalities") == ["audio"]
+    assert "thinking" in response.get("instructions", "")
+
+    await backend.close()

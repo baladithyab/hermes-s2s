@@ -86,6 +86,10 @@ class BridgeBuffer:
         self._dropped_input = 0
         self._underflows = 0
         self._output_drops = 0
+        # G3 (BACKLOG-0.3.2 F5): debounced warn + per-frame emission counters.
+        self._dropped_input_warn_threshold = 100
+        self._frames_emitted = 0
+        self._frames_underflow = 0
 
     # ---------------- input side (sync, thread-safe) ----------------
 
@@ -103,12 +107,34 @@ class BridgeBuffer:
             try:
                 self._input_q.get_nowait()
                 self._dropped_input += 1
+                if (
+                    self._dropped_input
+                    % self._dropped_input_warn_threshold
+                    == 0
+                ):
+                    logger.warning(
+                        "BridgeBuffer: %d input frames dropped so far "
+                        "(queue capacity=%d)",
+                        self._dropped_input,
+                        self._input_max,
+                    )
             except queue.Empty:  # pragma: no cover - race
                 pass
             try:
                 self._input_q.put_nowait((user_id, pcm))
             except queue.Full:  # pragma: no cover - pathological
                 self._dropped_input += 1
+                if (
+                    self._dropped_input
+                    % self._dropped_input_warn_threshold
+                    == 0
+                ):
+                    logger.warning(
+                        "BridgeBuffer: %d input frames dropped so far "
+                        "(queue capacity=%d)",
+                        self._dropped_input,
+                        self._input_max,
+                    )
 
     async def pop_input(
         self, poll_interval: float = 0.005
@@ -167,11 +193,26 @@ class BridgeBuffer:
         """
         with self._output_lock:
             if self._output_frames:
+                self._frames_emitted += 1
                 return self._output_frames.pop(0)
             self._underflows += 1
+            self._frames_underflow += 1
         return SILENCE_FRAME
 
     # ---------------- diagnostics ----------------
+
+    def stats(self) -> dict:
+        """Return a snapshot of buffer diagnostics (G3 / BACKLOG-0.3.2 F5)."""
+        with self._output_lock:
+            queue_depth_out = len(self._output_frames)
+        return {
+            "dropped_input": self._dropped_input,
+            "dropped_output": self._output_drops,
+            "queue_depth_in": self._input_q.qsize(),
+            "queue_depth_out": queue_depth_out,
+            "frames_emitted": self._frames_emitted,
+            "frames_underflow": self._frames_underflow,
+        }
 
     @property
     def dropped_input(self) -> int:
@@ -350,6 +391,19 @@ class RealtimeAudioBridge:
     def on_user_frame(self, user_id: int, pcm: bytes) -> None:
         """Called from the Discord receive thread. Thread-safe & non-blocking."""
         self.buffer.push_input(user_id, pcm)
+
+    def stats(self) -> dict:
+        """Return a snapshot of bridge + buffer diagnostics.
+
+        Delegates to ``self.buffer.stats()`` and augments with bridge-level
+        counters (G3 / BACKLOG-0.3.2 F5).
+        """
+        s = dict(self.buffer.stats())
+        s["backend_input_rate"] = self._backend_input_rate
+        s["backend_output_rate"] = self._backend_output_rate
+        s["closed"] = self._closed
+        s["tool_tasks_in_flight"] = len(self._tool_tasks)
+        return s
 
     # ---------------- bridge loop ----------------
 

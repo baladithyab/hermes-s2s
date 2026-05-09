@@ -119,6 +119,21 @@ def s2s_test_pipeline(args: dict, **kwargs: Any) -> str:
     })
 
 
+def s2s_doctor(args: dict, **kwargs: Any) -> str:
+    """LLM-callable: run the full pre-flight readiness check.
+
+    Delegates to ``hermes_s2s.doctor.run_doctor``. The ``probe`` arg (default
+    True) controls whether to open a 5s WS probe to the configured realtime
+    backend; set to False in CI or to avoid the ~$0.0001 probe cost.
+    """
+    probe = True
+    if isinstance(args, dict) and "probe" in args:
+        probe = bool(args.get("probe"))
+    from .doctor import run_doctor
+
+    return json.dumps(run_doctor(probe=probe), default=str)
+
+
 # ---------------------------------------------------------------------------
 # Slash command — /s2s
 # ---------------------------------------------------------------------------

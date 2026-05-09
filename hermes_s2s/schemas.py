@@ -35,6 +35,27 @@ S2S_SET_MODE = {
     },
 }
 
+S2S_DOCTOR = {
+    "name": "s2s_doctor",
+    "description": (
+        "Run a comprehensive pre-flight check on the hermes-s2s voice setup. "
+        "Use when the user asks 'is my voice setup working', 'why isn't voice "
+        "responding', 'check my speech-to-speech config'. Returns structured "
+        "JSON with passed/warning/error checks and remediation steps."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "probe": {
+                "type": "boolean",
+                "default": True,
+                "description": "Open a 5s WS probe to the configured realtime backend",
+            },
+        },
+        "required": [],
+    },
+}
+
 S2S_TEST_PIPELINE = {
     "name": "s2s_test_pipeline",
     "description": (

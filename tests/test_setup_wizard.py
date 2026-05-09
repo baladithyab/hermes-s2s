@@ -139,3 +139,93 @@ def test_env_stt_command_is_shell_quoted(tmp_path):
     # And the raw line must NOT be the naive single-quote wrap (which would
     # break on the embedded apostrophe).
     assert raw_value != f"'{tricky}'"
+
+
+# ---------------------------------------------------------------------------
+# G2: realtime profile tests
+# ---------------------------------------------------------------------------
+
+
+def _parse_dry_run_yaml(stdout: str) -> dict:
+    """Extract the YAML body between '# dry-run' header and the next '# .env' line."""
+    after = stdout.split("# dry-run", 1)[1].split("\n", 1)[1]
+    body = after.split("# .env")[0]
+    return yaml.safe_load(body)
+
+
+def test_setup_realtime_gemini_writes_full_config(capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    args = _make_args(
+        profile="realtime-gemini",
+        dry_run=True,
+        config_path=str(tmp_path / "config.yaml"),
+    )
+    rc = cli.cmd_setup(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    parsed = _parse_dry_run_yaml(out)
+    assert parsed["s2s"]["mode"] == "realtime"
+    assert parsed["s2s"]["realtime"]["provider"] == "gemini-live"
+    assert (
+        parsed["s2s"]["realtime"]["gemini_live"]["model"] == "gemini-live-2.5-flash"
+    )
+    assert parsed["s2s"]["realtime"]["gemini_live"]["voice"] == "Aoede"
+
+
+def test_setup_realtime_openai_writes_full_config(capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    args = _make_args(
+        profile="realtime-openai",
+        dry_run=True,
+        config_path=str(tmp_path / "config.yaml"),
+    )
+    rc = cli.cmd_setup(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    parsed = _parse_dry_run_yaml(out)
+    assert parsed["s2s"]["mode"] == "realtime"
+    assert parsed["s2s"]["realtime"]["provider"] == "gpt-realtime"
+    assert parsed["s2s"]["realtime"]["openai"]["model"] == "gpt-realtime"
+    assert parsed["s2s"]["realtime"]["openai"]["voice"] == "alloy"
+
+
+def test_setup_realtime_appends_monkeypatch_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_path = tmp_path / "config.yaml"
+    args = _make_args(profile="realtime-gemini", config_path=str(cfg_path))
+    rc = cli.cmd_setup(args)
+    assert rc == 0
+    # Config is written alongside; .env lives in the same parent directory
+    env_path = tmp_path / ".env"
+    assert env_path.exists(), "expected .env to be created next to config.yaml"
+    env_txt = env_path.read_text()
+    assert "HERMES_S2S_MONKEYPATCH_DISCORD=1" in env_txt
+    # Also verify the s2s block was merged into config.yaml
+    data = yaml.safe_load(cfg_path.read_text())
+    assert data["s2s"]["mode"] == "realtime"
+    assert data["s2s"]["realtime"]["provider"] == "gemini-live"
+
+
+def test_setup_realtime_idempotent_env_append(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_path = tmp_path / "config.yaml"
+    args = _make_args(profile="realtime-gemini", config_path=str(cfg_path))
+    cli.cmd_setup(args)
+    cli.cmd_setup(args)
+    env_txt = (tmp_path / ".env").read_text()
+    assert env_txt.count("HERMES_S2S_MONKEYPATCH_DISCORD=1") == 1
+
+
+def test_setup_realtime_warns_on_missing_api_key(capsys, tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    args = _make_args(
+        profile="realtime-gemini",
+        dry_run=True,
+        config_path=str(tmp_path / "config.yaml"),
+    )
+    cli.cmd_setup(args)
+    out = capsys.readouterr().out
+    assert "GEMINI_API_KEY" in out
+    assert "aistudio.google.com" in out
+
