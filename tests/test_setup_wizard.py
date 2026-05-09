@@ -105,3 +105,37 @@ def test_existing_config_keys_preserved(tmp_path, monkeypatch):
     # old provider entry remains alongside new one (deep merge, not replace)
     assert "old-provider" in data["tts"]["providers"]
     assert "hermes-s2s-kokoro" in data["tts"]["providers"]
+
+
+def test_env_stt_command_is_shell_quoted(tmp_path):
+    """P1-D: HERMES_LOCAL_STT_COMMAND must be shlex.quote'd, not naive '{cmd}'.
+
+    Pass a command containing an apostrophe and a space — naive single-quote
+    wrapping would produce unparseable shell syntax. Verify the written line
+    round-trips cleanly through shlex.split so a shell/dotenv parser can
+    recover the original command.
+    """
+    import shlex as _shlex
+
+    env_path = tmp_path / ".env"
+    tricky = "hermes-s2s-stt --note \"it's fine\" --input {input_path} --output {output_path}"
+
+    wrote = cli._write_env_command(env_path, tricky)
+    assert wrote is True
+    content = env_path.read_text()
+    assert "HERMES_LOCAL_STT_COMMAND=" in content
+
+    # Extract the VALUE portion of the HERMES_LOCAL_STT_COMMAND=... line.
+    value_line = next(
+        line for line in content.splitlines() if line.startswith("HERMES_LOCAL_STT_COMMAND=")
+    )
+    raw_value = value_line.split("=", 1)[1]
+
+    # shlex.split must yield exactly one token which, when dequoted, equals
+    # the original command — i.e. the shell-quoted form is faithful.
+    tokens = _shlex.split(raw_value)
+    assert tokens == [tricky]
+
+    # And the raw line must NOT be the naive single-quote wrap (which would
+    # break on the embedded apostrophe).
+    assert raw_value != f"'{tricky}'"

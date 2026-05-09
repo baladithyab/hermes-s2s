@@ -41,11 +41,38 @@ def _build_opts(args: argparse.Namespace) -> dict:
     return opts
 
 
-def _resolve_output_path(args: argparse.Namespace) -> Path:
-    if args.output:
-        return Path(args.output)
+def _resolve_output_paths(args: argparse.Namespace) -> list[Path]:
+    """Resolve the list of paths to write the transcript to.
+
+    Contract (defensive double-write — see P1-A/P1-B in wave-0.2.0 cold review):
+
+    * When ``--output`` is omitted, write to BOTH:
+        - ``Path(input).with_suffix('.txt')`` — basename-stripped (``clip.wav`` → ``clip.txt``)
+        - ``Path(input + '.txt')`` — sticky, suffix-preserved (``clip.wav.txt``)
+
+    * When ``--output`` IS given, write to the requested output AND ALSO to
+      the audio-sibling basename-stripped ``.txt`` for safety.
+
+    Duplicates are filtered while preserving order so callers only see each
+    unique path once.
+    """
     inp = Path(args.input)
-    return inp.with_suffix(inp.suffix + ".txt") if inp.suffix else inp.with_suffix(".txt")
+    stripped = inp.with_suffix(".txt")
+    sticky = inp.with_suffix(inp.suffix + ".txt") if inp.suffix else inp.with_suffix(".txt")
+
+    if args.output:
+        candidates = [Path(args.output), stripped]
+    else:
+        candidates = [stripped, sticky]
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for p in candidates:
+        resolved = p
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(resolved)
+    return ordered
 
 
 def main() -> int:
@@ -68,9 +95,12 @@ def main() -> int:
             print(f"hermes-s2s-stt error: {err}", file=sys.stderr)
             return 1
 
-        out_path = _resolve_output_path(args)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(result.get("transcript", ""), encoding="utf-8")
+        transcript = result.get("transcript", "")
+        out_paths = _resolve_output_paths(args)
+        for out_path in out_paths:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(transcript, encoding="utf-8")
+            print(str(out_path))
         return 0
     except Exception as exc:  # noqa: BLE001 — shim must convert to exit code
         print(f"hermes-s2s-stt error: {exc}", file=sys.stderr)

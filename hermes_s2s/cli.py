@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -87,9 +88,15 @@ def _profile_blocks(profile: str) -> tuple[dict, dict, str | None]:
 def _custom_prompt() -> tuple[dict, dict, str | None]:
     print("Custom profile — answer each prompt (blank = skip).")
     tts_provider = input("TTS provider name [hermes-s2s-kokoro]: ").strip() or "hermes-s2s-kokoro"
-    tts_cmd = input(f"TTS command for {tts_provider} [leave blank for default kokoro]: ").strip()
+    tts_cmd = input(
+        f"TTS command for {tts_provider} "
+        "[leave blank to skip writing tts.providers block — you'll need to configure manually]: "
+    ).strip()
     stt_provider = input("STT provider name [local]: ").strip() or "local"
-    stt_cmd = input("HERMES_LOCAL_STT_COMMAND [blank to skip]: ").strip()
+    stt_cmd = input(
+        "HERMES_LOCAL_STT_COMMAND "
+        "[leave blank to skip writing tts.providers block — you'll need to configure manually]: "
+    ).strip()
     tts: dict[str, Any] = {"provider": tts_provider}
     if tts_cmd:
         tts["providers"] = {
@@ -144,7 +151,7 @@ def _write_env_command(env_path: Path, command: str) -> bool:
     existing = env_path.read_text() if env_path.exists() else ""
     if _ENV_MARKER in existing:
         return False
-    line = f"\n{_ENV_MARKER}\nHERMES_LOCAL_STT_COMMAND='{command}'\n"
+    line = f"\n{_ENV_MARKER}\nHERMES_LOCAL_STT_COMMAND={shlex.quote(command)}\n"
     with env_path.open("a") as f:
         f.write(line)
     return True
@@ -216,7 +223,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("# dry-run: config that would be merged into config.yaml")
         print(yaml.safe_dump(new_config, sort_keys=False))
         if stt_env_cmd:
-            print(f"# .env: HERMES_LOCAL_STT_COMMAND='{stt_env_cmd}'")
+            print(f"# .env: HERMES_LOCAL_STT_COMMAND={shlex.quote(stt_env_cmd)}")
         return 0
 
     cfg_path = Path(args.config_path) if args.config_path else Path.home() / ".hermes" / "config.yaml"
