@@ -1,0 +1,34 @@
+name: hermes-s2s
+version: 0.1.0
+description: Configurable speech-to-speech for Hermes — realtime duplex, cascaded pipelines, local servers, fully mix-and-match.
+author: Codeseys
+license: Apache-2.0
+homepage: https://github.com/codeseys/hermes-s2s
+
+provides_tools:
+  - s2s_status
+  - s2s_set_mode
+  - s2s_test_pipeline
+
+provides_hooks:
+  - on_session_start
+
+# Optional API keys — plugin still works without all of these set.
+# Realtime backends need their respective key; cascaded local pipeline needs none.
+optional_env:
+  - name: GEMINI_API_KEY
+    description: Required to use the gemini-live realtime backend
+    url: https://aistudio.google.com/apikey
+    secret: true
+  - name: OPENAI_API_KEY
+    description: Required to use the gpt-realtime / gpt-realtime-mini backends
+    url: https://platform.openai.com/api-keys
+    secret: true
+  - name: GROQ_API_KEY
+    description: Optional — fast cloud STT in cascaded mode
+    url: https://console.groq.com/keys
+    secret: true
+  - name: ELEVENLABS_API_KEY
+    description: Optional — premium TTS in cascaded mode
+    url: https://elevenlabs.io/app/settings/api-keys
+    secret: true

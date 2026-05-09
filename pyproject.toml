@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-s2s"
+version = "0.1.0"
+description = "Configurable speech-to-speech for Hermes Agent — realtime, cascaded, and local-pipeline backends."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Codeseys" }]
+keywords = ["hermes-agent", "speech-to-speech", "voice", "stt", "tts", "realtime", "discord-bot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+    "websockets>=12.0",
+    "httpx>=0.25",
+]
+
+[project.optional-dependencies]
+# Local STT
+moonshine = ["moonshine-onnx>=0.2.0"]
+# Local TTS
+kokoro = ["kokoro>=0.7.0"]
+# Resampling for non-16kHz inputs
+audio = ["scipy>=1.11"]
+# Realtime backends — uses websockets + httpx (already in core deps)
+realtime = []
+# Server-mode client — uses websockets (already in core deps)
+server-client = []
+# Convenience: full local pipeline
+local-all = ["hermes-s2s[moonshine,kokoro,audio]"]
+# Convenience: full feature set
+all = [
+    "hermes-s2s[moonshine,kokoro,audio,realtime,server-client]",
+]
+# Dev / testing
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "ruff>=0.1",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-s2s = "hermes_s2s"
+
+[tool.setuptools]
+packages = ["hermes_s2s", "hermes_s2s.providers", "hermes_s2s.providers.stt",
+            "hermes_s2s.providers.tts", "hermes_s2s.providers.realtime",
+            "hermes_s2s.providers.pipeline", "hermes_s2s.config",
+            "hermes_s2s.audio", "hermes_s2s._internal"]
+
+[tool.setuptools.package-data]
+hermes_s2s = ["plugin.yaml", "skills/**/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

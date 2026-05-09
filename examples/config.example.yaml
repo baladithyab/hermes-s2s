@@ -1,0 +1,33 @@
+# Example config — drop into ~/.hermes/config.yaml under the s2s: key.
+# Pick one of the recipes below or mix.
+
+s2s:
+  mode: cascaded         # cascaded | realtime | s2s-server
+
+  pipeline:
+    stt:
+      provider: moonshine        # moonshine | local | groq | openai | mistral | xai | s2s-server
+      moonshine:
+        model: tiny              # tiny (27M, fast) | base (61M, more accurate)
+        device: cuda             # cuda | cpu
+    tts:
+      provider: kokoro           # kokoro | edge | elevenlabs | openai | piper | neutts | s2s-server
+      kokoro:
+        voice: af_heart          # American Female (Hexgrad-trained default)
+        lang_code: a             # a (American English), b (British), j (Japanese), z (Chinese), ...
+        speed: 1.0
+
+  realtime:
+    provider: gemini-live        # gemini-live | gpt-realtime | gpt-realtime-mini
+    gemini_live:
+      model: gemini-live-2.5-flash    # half-cascade ($0.06 / 30min)
+      voice: Aoede                    # Aoede | Charon | Fenrir | Kore | Puck | ...
+    openai:
+      model: gpt-realtime-mini        # gpt-realtime-mini ($0.45) | gpt-realtime ($1.44)
+      voice: cedar                    # alloy | echo | fable | onyx | nova | shimmer | cedar | marin
+
+  s2s_server:
+    endpoint: ws://localhost:8000/ws
+    health_url: http://localhost:8000/health
+    auto_launch: false
+    fallback_to: pipeline             # pipeline | none — what to do when the server is down
