@@ -384,3 +384,54 @@ def test_leave_voice_channel_closes_matching_bridge(monkeypatch):
     before = FakeAdapter.leave_voice_channel
     discord_bridge._wrap_leave_voice_channel(FakeAdapter)
     assert FakeAdapter.leave_voice_channel is before
+
+
+
+# ---------------------------------------------------------------------------
+# (e) regression: first frame of a brand-new SSRC must fire the callback
+#     (Phase-8 Claude P1 #1: fallback was len(buf) not 0, dropping new users)
+# ---------------------------------------------------------------------------
+
+
+def test_install_frame_callback_fires_for_brand_new_ssrc():
+    """When a new user starts speaking mid-call, their first decoded frame
+    appears in _buffers[ssrc] for the first time. The shim's diff snapshot
+    must use 0 (not len(buf)) as the prev fallback so the FULL buffer fires.
+    """
+    received: list[tuple[int, bytes]] = []
+
+    # Fake VoiceReceiver: _on_packet appends fixed PCM to _buffers[NEW_SSRC]
+    NEW_SSRC = 12345
+    PCM_PAYLOAD = b"\xab\xcd" * 1920  # one frame's worth
+
+    class FakeReceiver:
+        _buffers: dict = {}
+        _ssrc_to_user: dict = {NEW_SSRC: 99}
+
+        def _on_packet(self, data: bytes) -> None:
+            self._buffers.setdefault(NEW_SSRC, bytearray()).extend(PCM_PAYLOAD)
+
+    receiver = FakeReceiver()
+
+    def callback(user_id: int, pcm: bytes) -> None:
+        received.append((user_id, pcm))
+
+    discord_bridge._install_frame_callback(receiver, callback)
+    # Trigger a packet — the SSRC was NOT in _prev_lens (this is its first
+    # appearance), so the shim must use the 0-fallback or the diff is 0.
+    receiver._on_packet(b"raw_opus_data")
+
+    assert len(received) == 1, (
+        f"expected 1 callback for new SSRC, got {len(received)}: {received!r}"
+    )
+    assert received[0][0] == 99
+    assert received[0][1] == bytes(PCM_PAYLOAD), (
+        f"expected full payload, got {len(received[0][1])} of {len(PCM_PAYLOAD)} bytes"
+    )
+
+    # Second packet from same SSRC: only the NEW bytes should appear.
+    receiver._on_packet(b"raw_opus_data_2")
+    assert len(received) == 2
+    assert received[1][1] == bytes(PCM_PAYLOAD), (
+        "second packet should produce ONLY its appended bytes, not the cumulative buffer"
+    )

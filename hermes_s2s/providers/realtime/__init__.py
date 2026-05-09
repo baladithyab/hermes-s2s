@@ -45,6 +45,9 @@ class RealtimeBackend(Protocol):
     async def close(self) -> None: ...
 
 
+from hermes_s2s import __version__ as _pkg_version
+
+
 class _BaseRealtimeBackend:
     """Stub base — not implemented yet. Subclasses should raise NotImplementedError
     with a helpful message until the backend is wired in.
@@ -57,7 +60,7 @@ class _BaseRealtimeBackend:
 
     async def connect(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError(
-            f"{self.NAME} realtime backend is a stub in this 0.3.0 release. "
+            f"{self.NAME} realtime backend is a stub in this {_pkg_version} release. "
             "Track progress at https://github.com/codeseys/hermes-s2s — "
             "PRs welcome."
         )

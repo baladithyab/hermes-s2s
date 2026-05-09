@@ -20,7 +20,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 from typing import Any, Awaitable, Callable
+
+logger = logging.getLogger(__name__)
 
 
 DispatchFn = Callable[[str, dict], Any]  # may be sync or async
@@ -99,10 +102,18 @@ class HermesToolBridge:
                 )
             except asyncio.TimeoutError:
                 # Soft timeout — fire filler, keep waiting for the real result.
+                # Filler is best-effort: if the backend stub raises
+                # NotImplementedError, or if the underlying WS is closed /
+                # throws a network error, we log and keep the tool running.
+                # Letting any other exception propagate here would orphan
+                # the in-flight tool_task (we'd leave the timeouts path
+                # without cancelling the task).
                 try:
                     await backend.send_filler_audio("let me check on that")
-                except NotImplementedError:
-                    pass
+                except Exception as filler_exc:  # noqa: BLE001
+                    logger.warning(
+                        "send_filler_audio failed: %s", filler_exc
+                    )
                 remaining = max(self._hard - self._soft, 0.0)
                 try:
                     result = await asyncio.wait_for(tool_task, remaining)

@@ -252,6 +252,9 @@ class RealtimeAudioBridge:
         *,
         buffer: Optional[BridgeBuffer] = None,
         input_queue_max: int = INPUT_QUEUE_MAX,
+        system_prompt: str = "You are a helpful voice assistant.",
+        voice: Optional[str] = None,
+        tools: Optional[list] = None,
     ) -> None:
         self.backend = backend
         self.tool_bridge = tool_bridge
@@ -261,17 +264,37 @@ class RealtimeAudioBridge:
         in_rate, out_rate = _resolve_backend_rates(backend)
         self._backend_input_rate = in_rate
         self._backend_output_rate = out_rate
+        self._system_prompt = system_prompt
+        self._voice = voice
+        self._tools = list(tools) if tools is not None else []
         self._task: Optional[asyncio.Task[None]] = None
         self._children: list[asyncio.Task[Any]] = []
         self._closed = False
         self._stop_event: Optional[asyncio.Event] = None
+        self._tool_tasks: set[asyncio.Task[Any]] = set()
+        # Tool-call ordering primitives (created lazily on first tool_call
+        # so they bind to the running loop, not the constructor's loop).
+        self._tool_seq_lock: Optional[asyncio.Lock] = None
+        self._tool_seq_cond: Optional[asyncio.Condition] = None
+        self._tool_seq_next_dispatch = 0
+        self._tool_seq_next_inject = 0
 
     # ---------------- public API ----------------
 
     async def start(self) -> None:
-        """Start the bridge loop. Idempotent."""
+        """Start the bridge loop. Idempotent.
+
+        Connects the backend BEFORE spawning pump tasks — the pumps rely on
+        a live session (send_audio_chunk / recv_events both assume the WS
+        is open). Connection errors propagate so the caller can log & abort
+        cleanly instead of silently feeding frames into a closed socket.
+        """
         if self._task is not None and not self._task.done():
             return
+        # Connect first so the pumps have a live session when they start.
+        await self.backend.connect(
+            self._system_prompt, self._voice, self._tools
+        )
         self._closed = False
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(
@@ -302,6 +325,18 @@ class RealtimeAudioBridge:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._children.clear()
+        # Cancel any in-flight tool tasks (their own cleanup in tool_bridge
+        # will settle tool_task cancellation; this just drains the bridge-
+        # side wrapper tasks so close() doesn't leak them).
+        for t in list(self._tool_tasks):
+            if not t.done():
+                t.cancel()
+        for t in list(self._tool_tasks):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._tool_tasks.clear()
         # Close the backend.
         close = getattr(self.backend, "close", None)
         if close is not None:
@@ -352,23 +387,16 @@ class RealtimeAudioBridge:
                 await asyncio.sleep(0.005)
                 continue
             try:
-                if self._backend_input_rate == DISCORD_SAMPLE_RATE:
-                    # Same-rate path still needs stereo→mono mixdown.
-                    resampled = resample_pcm(
-                        pcm,
-                        src_rate=DISCORD_SAMPLE_RATE,
-                        dst_rate=self._backend_input_rate,
-                        src_channels=DISCORD_CHANNELS,
-                        dst_channels=1,
-                    )
-                else:
-                    resampled = resample_pcm(
-                        pcm,
-                        src_rate=DISCORD_SAMPLE_RATE,
-                        dst_rate=self._backend_input_rate,
-                        src_channels=DISCORD_CHANNELS,
-                        dst_channels=1,
-                    )
+                # resample_pcm handles equal-rate as a fast path and also
+                # performs the stereo→mono mixdown Discord input always
+                # requires, so one call covers both branches.
+                resampled = resample_pcm(
+                    pcm,
+                    src_rate=DISCORD_SAMPLE_RATE,
+                    dst_rate=self._backend_input_rate,
+                    src_channels=DISCORD_CHANNELS,
+                    dst_channels=1,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -434,13 +462,63 @@ class RealtimeAudioBridge:
                     name,
                 )
                 return
-            try:
-                await self.tool_bridge.handle_tool_call(
-                    self.backend, call_id, name, args
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("tool_bridge.handle_tool_call raised")
+            # ADR-0008 §3: multiple tool_calls from a single turn run in
+            # PARALLEL; their results MUST be injected back in the order
+            # the model emitted them. Dispatch as a task so a slow tool
+            # doesn't stall subsequent events, and chain in-order result
+            # injection via an asyncio.Lock-serialized injector.
+            task = asyncio.create_task(
+                self._run_and_inject_tool(call_id, name, args),
+                name=f"bridge.tool_call[{call_id or name}]",
+            )
+            self._tool_tasks.add(task)
+            task.add_done_callback(self._tool_tasks.discard)
         elif etype == "error":
             logger.warning("backend error event: %r", payload)
         # transcript_partial / transcript_final / session_resumed: ignored
         # for 0.3.1. Future: forward to Hermes session log.
+
+    async def _run_and_inject_tool(
+        self, call_id: str, name: str, args: dict
+    ) -> None:
+        """Run a tool_call in parallel with others, inject result in emission order.
+
+        Each dispatched tool gets a sequence number; a shared injection
+        gate ensures inject_tool_result calls happen in the original order
+        even if later-dispatched tools finish first.
+        """
+        # Claim emission order under a lock so concurrent dispatches serialize
+        # their sequence assignment correctly. Lazily create loop-bound
+        # primitives on first call.
+        if self._tool_seq_lock is None:
+            self._tool_seq_lock = asyncio.Lock()
+            self._tool_seq_cond = asyncio.Condition()
+        async with self._tool_seq_lock:
+            my_seq = self._tool_seq_next_dispatch
+            self._tool_seq_next_dispatch += 1
+
+        try:
+            result = await self.tool_bridge.handle_tool_call(
+                self.backend, call_id, name, args
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("tool_bridge.handle_tool_call raised")
+            # Advance the injection pointer even on failure so later tools
+            # aren't blocked waiting for a result that will never arrive.
+            async with self._tool_seq_cond:
+                while self._tool_seq_next_inject != my_seq:
+                    await self._tool_seq_cond.wait()
+                self._tool_seq_next_inject += 1
+                self._tool_seq_cond.notify_all()
+            return
+
+        # Wait until it's our turn to inject (preserves emission order).
+        async with self._tool_seq_cond:
+            while self._tool_seq_next_inject != my_seq:
+                await self._tool_seq_cond.wait()
+            try:
+                await self.backend.inject_tool_result(call_id, result)
+            except Exception:  # noqa: BLE001
+                logger.exception("backend.inject_tool_result raised")
+            self._tool_seq_next_inject += 1
+            self._tool_seq_cond.notify_all()

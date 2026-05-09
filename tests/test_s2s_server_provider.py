@@ -54,14 +54,18 @@ def test_websocket_scheme_warns_and_raises(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         stt = S2SServerSTT(endpoint="ws://localhost:9000/asr")
         tts = S2SServerTTS(endpoint="wss://localhost:9000/tts")
-    assert any("0.3.0" in r.message or "WebSocket" in r.message for r in caplog.records)
+    # The warning should mention WebSocket pipeline mode (exact version
+    # string shouldn't be pinned — it drifts every release. Whether or not
+    # the WS pipeline is implemented later can flip this assertion, but the
+    # "WebSocket" phrase is stable.)
+    assert any("WebSocket" in r.message for r in caplog.records)
     assert stt._scheme == "ws" and tts._scheme == "ws"
 
     audio = tmp_path / "a.wav"
     audio.write_bytes(b"x")
-    with pytest.raises(SttUnavail, match="0.3.0"):
+    with pytest.raises(SttUnavail, match="WebSocket"):
         stt.transcribe(audio)
-    with pytest.raises(TtsUnavail, match="0.3.0"):
+    with pytest.raises(TtsUnavail, match="WebSocket"):
         tts.synthesize("hi", tmp_path / "o.wav")
 
 

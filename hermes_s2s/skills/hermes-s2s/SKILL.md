@@ -1,7 +1,7 @@
 ---
 name: hermes-s2s
 description: "Configure and operate the hermes-s2s plugin — switch S2S modes (cascaded/realtime/s2s-server), pick per-stage providers, run smoke tests, troubleshoot Discord VC voice."
-version: 0.3.0
+version: 0.3.1
 author: Codeseys
 license: Apache-2.0
 metadata:
@@ -146,7 +146,7 @@ brew install espeak-ng           # (macOS)
 
 ### "Realtime mode not implemented yet"
 
-That's expected for realtime Discord audio bridging in 0.3.0 — the bridge is setup-plumbing only (version gate, monkey-patch site, config branch). Your Discord bot will continue to use Hermes's built-in STT -> text -> TTS path; Gemini Live / OpenAI Realtime audio routing lands in 0.3.1. The realtime backend classes themselves (`gemini-live`, `gpt-realtime-mini`) are implemented — they work today for non-Discord use cases (CLI, tests, future platforms). Track progress at https://github.com/codeseys/hermes-s2s. Use `cascaded` or `s2s-server` for Discord voice in the meantime.
+That's expected only if your plugin is older than 0.3.1 — the realtime Discord audio bridge shipped in 0.3.1. Upgrade to 0.3.1+ and set `HERMES_S2S_MONKEYPATCH_DISCORD=1` (see HOWTO-REALTIME-DISCORD.md) to route Discord VC audio through Gemini Live / OpenAI Realtime. The realtime backend classes themselves (`gemini-live`, `gpt-realtime-mini`) work today for non-Discord use cases too (CLI, tests, future platforms). Track progress at https://github.com/codeseys/hermes-s2s. Use `cascaded` or `s2s-server` for Discord voice if you can't upgrade.
 
 ## Architecture (one paragraph)
 
@@ -154,7 +154,7 @@ Each S2S mode resolves to one or more provider factories from a registry (`herme
 
 ## Pitfalls
 
-- **Hermes built-in voice mode is still active** — `hermes-s2s` adds providers; it does not replace `tools/transcription_tools.py` and `tools/tts_tool.py`. If a user has `stt.provider: groq` set in `voice.stt.provider` (Hermes built-in) AND `s2s.pipeline.stt.provider: moonshine` (this plugin), the built-in wins for built-in voice mode. The 0.2.0 command-provider shims (`hermes-s2s-tts` / `hermes-s2s-stt`) route cascaded mode through this plugin; realtime Discord audio bridging is setup-plumbing only in 0.3.0 and completes in 0.3.1.
+- **Hermes built-in voice mode is still active** — `hermes-s2s` adds providers; it does not replace `tools/transcription_tools.py` and `tools/tts_tool.py`. If a user has `stt.provider: groq` set in `voice.stt.provider` (Hermes built-in) AND `s2s.pipeline.stt.provider: moonshine` (this plugin), the built-in wins for built-in voice mode. The 0.2.0 command-provider shims (`hermes-s2s-tts` / `hermes-s2s-stt`) route cascaded mode through this plugin; realtime Discord audio bridging shipped in 0.3.1.
 - **GPU contention with gaming** — local pipeline (Moonshine + Kokoro) shares VRAM with the user's RTX 5090. Document expectation; offer `device: cpu` overrides in config.
 - **espeak-ng** — Kokoro's phonemizer backend on Linux. Already a Hermes voice-mode dep for NeuTTS; safe to assume it's present.
 - **WSL audio I/O** — there's no audio device in WSL by default. CLI mic mode does NOT work; only Discord/Telegram bot voice (network audio) works. Document.

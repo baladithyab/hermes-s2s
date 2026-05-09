@@ -26,7 +26,7 @@ from typing import Any, AsyncIterator, Dict
 class S2SServerPipeline:
     """Full-duplex pipeline backed by an external WS server.
 
-    Stub for 0.3.0. Real impl will use the `websockets` package to:
+    Stub. Real impl will use the `websockets` package to:
       1. Open WS, send turn_start.
       2. Stream Float32 PCM frames inbound.
       3. Receive asr_partial, asr_result, tts_chunk events.
@@ -46,7 +46,7 @@ class S2SServerPipeline:
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stub. Yields {"type": "audio_chunk"|"transcript", ...} events."""
         raise NotImplementedError(
-            "s2s-server pipeline backend is a stub in 0.3.0. "
+            "s2s-server pipeline backend is not implemented yet. "
             "Run your streaming-speech-to-speech server independently for now and "
             "use stage-only mode (stt.provider: s2s-server / tts.provider: s2s-server). "
             "Track progress at https://github.com/codeseys/hermes-s2s."

@@ -331,7 +331,19 @@ def _attach_realtime_to_voice_client(
             tool_bridge = None
 
     # (d) Audio bridge
-    bridge = RealtimeAudioBridge(backend=backend, tool_bridge=tool_bridge)
+    # Pull system_prompt + voice from cfg.realtime_options so users can
+    # customize without re-rolling their own backend. Tools stay empty for
+    # 0.3.1 — real tool list wiring to Hermes's registry is 0.3.2.
+    realtime_opts = getattr(cfg, "realtime_options", {}) or {}
+    bridge = RealtimeAudioBridge(
+        backend=backend,
+        tool_bridge=tool_bridge,
+        system_prompt=realtime_opts.get(
+            "system_prompt", "You are a helpful voice assistant. Respond briefly."
+        ),
+        voice=realtime_opts.get("voice", None),
+        tools=[],
+    )
 
     # (e) Frame callback — see SPIKE notes at top of module re: monkey-patch
     if voice_receiver is not None:
@@ -454,7 +466,11 @@ def _install_frame_callback(voice_receiver: Any, callback: Any) -> None:
         ssrc_map = getattr(_rcv, "_ssrc_to_user", {}) or {}
         try:
             for ssrc, buf in list(buffers.items()):
-                prev = before.get(ssrc, _prev_lens.get(ssrc, len(buf)))
+                # Fall back to 0 (NOT len(buf)) so the first frame for a
+                # brand-new SSRC produces the full buffer as the diff —
+                # otherwise a new user joining mid-call would silently
+                # drop their first decoded frame.
+                prev = before.get(ssrc, _prev_lens.get(ssrc, 0))
                 _prev_lens[ssrc] = len(buf)
                 if len(buf) <= prev:
                     continue
@@ -541,13 +557,14 @@ def _voice_pipeline_factory(adapter: Any, voice_client: Any, config: Any) -> Any
     """Placeholder pipeline factory for the native hook path.
 
     Returns a stub object that satisfies the expected VoicePipeline protocol.
-    Real implementation lands alongside 0.3.1's audio loop.
+    Real implementation lands alongside the native-hook path (post-0.3.1 /
+    whenever Hermes ships ``register_voice_pipeline_factory``).
     """
     return _StubVoicePipeline(adapter, voice_client, config)
 
 
 class _StubVoicePipeline:
-    """No-op VoicePipeline — logs lifecycle calls until 0.3.1 ships the real one."""
+    """No-op VoicePipeline — logs lifecycle calls until the native-hook real one lands."""
 
     def __init__(self, adapter: Any, voice_client: Any, config: Any) -> None:
         self._adapter = adapter

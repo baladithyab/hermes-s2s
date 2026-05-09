@@ -75,6 +75,7 @@ def _make_backend(
     be.NAME = name
     be.input_sample_rate = input_rate
     be.output_sample_rate = output_rate
+    be.connect = AsyncMock()
     be.send_audio_chunk = AsyncMock()
     be.close = AsyncMock()
     be.inject_tool_result = AsyncMock()
@@ -85,6 +86,55 @@ def _make_backend(
 
 
 # ---------- a. round-trip ----------
+
+async def _connect_then_pumps(bridge: "RealtimeAudioBridge") -> None:
+    """Helper for connect-before-pumps test: starts and immediately closes."""
+    await bridge.start()
+    # Give the loop one tick so any pump task that would race could.
+    await asyncio.sleep(0.01)
+    await bridge.close()
+
+
+def test_bridge_start_calls_backend_connect_before_pumps() -> None:
+    """ADR-0007: backend.connect must be awaited BEFORE pump tasks run.
+
+    Regression test for Phase-8 Kimi P0 #1: the bot was silent in VC because
+    start() spawned the pump tasks without first opening the WS session.
+    """
+    backend = _make_backend()
+    # Track whether send_audio_chunk or recv_events ever fires before connect.
+    call_order: list[str] = []
+
+    async def _record_connect(*a: Any, **kw: Any) -> None:
+        call_order.append("connect")
+
+    backend.connect.side_effect = _record_connect
+    backend.send_audio_chunk.side_effect = lambda *a, **kw: call_order.append("send")
+    original_recv = backend.recv_events
+    def _record_recv(*a: Any, **kw: Any) -> Any:
+        call_order.append("recv")
+        return original_recv(*a, **kw)
+    backend.recv_events = _record_recv
+
+    bridge = RealtimeAudioBridge(
+        backend=backend,
+        system_prompt="test prompt",
+        voice="test_voice",
+        tools=[],
+    )
+    asyncio.run(_connect_then_pumps(bridge))
+
+    # connect must be called, must come first
+    assert "connect" in call_order, f"connect was never called: {call_order}"
+    assert call_order[0] == "connect", f"connect was not first: {call_order}"
+    backend.connect.assert_awaited_once()
+    # connect should have been called with our system_prompt + voice + tools
+    args, kwargs = backend.connect.call_args
+    # Accept either positional or kwarg form
+    all_args = list(args) + list(kwargs.values())
+    assert "test prompt" in all_args
+    assert "test_voice" in all_args
+
 
 def test_bridge_buffer_input_round_trip() -> None:
     """push_input from a thread; pop_input from the asyncio loop."""

@@ -36,7 +36,8 @@ class S2SServerTTS:
         if parsed.scheme in ("ws", "wss"):
             logger.warning(
                 "s2s-server TTS configured with %s:// endpoint; WebSocket pipeline "
-                "mode is 0.3.0+. Falling back / raising on use.", parsed.scheme,
+                "mode is not implemented yet. Falling back / raising on use.",
+                parsed.scheme,
             )
             self._scheme = "ws"
         else:
@@ -61,7 +62,7 @@ class S2SServerTTS:
     def synthesize(self, text: str, output_path: str | Path) -> str:
         if self._scheme == "ws":
             raise S2SServerUnavailable(
-                "WebSocket pipeline mode is 0.3.0+; use http(s):// endpoints for stage-only providers"
+                "WebSocket pipeline mode is not implemented yet; use http(s):// endpoints for stage-only providers"
             )
         try:
             import httpx  # type: ignore
