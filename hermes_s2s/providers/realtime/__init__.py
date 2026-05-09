@@ -61,7 +61,7 @@ class _BaseRealtimeBackend:
     async def connect(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError(
             f"{self.NAME} realtime backend is a stub in this {_pkg_version} release. "
-            "Track progress at https://github.com/codeseys/hermes-s2s — "
+            "Track progress at https://github.com/baladithyab/hermes-s2s — "
             "PRs welcome."
         )
 

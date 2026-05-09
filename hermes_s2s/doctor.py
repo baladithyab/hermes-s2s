@@ -131,8 +131,8 @@ def _configuration_checks(cfg: Any) -> List[Dict[str, Any]]:
 def _python_dep_checks() -> List[Dict[str, Any]]:
     # (module_name, pip_hint, required_for_label)
     deps = [
-        ("moonshine_onnx", "pip install hermes-s2s[local-stt]", "local STT"),
-        ("kokoro", "pip install hermes-s2s[local-tts]", "local TTS"),
+        ("moonshine_onnx", "pip install hermes-s2s[moonshine]", "local STT"),
+        ("kokoro", "pip install hermes-s2s[kokoro]", "local TTS"),
         ("scipy", "pip install scipy", "audio resampling"),
         ("websockets", "pip install hermes-s2s[realtime]", "realtime backends"),
         ("discord", "pip install discord.py", "Discord voice bridge"),
@@ -315,12 +315,54 @@ def _hermes_integration_checks(cfg: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _default_voice_for(provider: str) -> str:
+    """Return a sensible default voice for the given realtime provider.
+
+    Gemini Live defaults to "Aoede"; OpenAI GA/mini realtime defaults to
+    "alloy". Other providers fall back to "Aoede" just because the doctor
+    probe is read-only and any valid string is sufficient to trigger a
+    session.update round-trip.
+    """
+    p = (provider or "").lower()
+    if "gemini" in p:
+        return "Aoede"
+    if "openai" in p or "gpt-realtime" in p:
+        return "alloy"
+    return "Aoede"
+
+
+def _active_provider_block(cfg: Any) -> tuple[str, Dict[str, Any]]:
+    """Return ``(provider_block_key, provider_block_dict)`` for the active provider.
+
+    Maps realtime_provider names to their config sub-block key:
+      * gemini-live  -> "gemini_live"
+      * gpt-realtime / gpt-realtime-mini -> "openai"
+
+    Returns an empty dict if the block is missing.
+    """
+    provider = (getattr(cfg, "realtime_provider", "") or "").lower()
+    options = getattr(cfg, "realtime_options", {}) or {}
+    if "gemini" in provider:
+        key = "gemini_live"
+    elif "openai" in provider or "gpt-realtime" in provider:
+        key = "openai"
+    else:
+        key = provider.replace("-", "_")
+    block = options.get(key) if isinstance(options, dict) else None
+    return key, (block if isinstance(block, dict) else {})
+
+
 async def _probe_backend_async(cfg: Any, timeout: float = 5.0) -> Dict[str, Any]:
     """Instantiate the configured realtime backend and probe WS connectivity.
 
     Lazy-imports resolve_realtime + the backend module so importing doctor.py
     never drags the realtime extra. Catches *all* exceptions — the only
-    outcomes are pass/fail with a descriptive message.
+    outcomes are pass/warn/fail with a descriptive message.
+
+    Outcomes (per P1-6):
+      * "pass"  — connected AND received at least one server event within 2s
+      * "warn"  — connected but no server events within 2s (soft warning)
+      * "fail"  — connect() itself failed or timed out
     """
     try:
         from hermes_s2s.registry import resolve_realtime
@@ -343,13 +385,17 @@ async def _probe_backend_async(cfg: Any, timeout: float = 5.0) -> Dict[str, Any]
             "remediation": "pip install hermes-s2s[realtime]  (or check provider name)",
         }
 
+    # Resolve voice + system prompt from the provider-specific block.
+    _provider_key, provider_block = _active_provider_block(cfg)
+    voice = provider_block.get("voice") or _default_voice_for(provider)
+    system_prompt = (
+        provider_block.get("system_prompt")
+        or "pre-flight doctor probe (read-only)"
+    )
+
     try:
         await asyncio.wait_for(
-            backend.connect(
-                "pre-flight doctor probe (read-only)",
-                getattr(cfg, "realtime_options", {}).get("voice") or "Aoede",
-                [],
-            ),
+            backend.connect(system_prompt, voice, []),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -373,22 +419,67 @@ async def _probe_backend_async(cfg: Any, timeout: float = 5.0) -> Dict[str, Any]
             "remediation": "Verify API key is valid and has realtime-model access",
         }
 
-    # Connected — close and report pass.
+    # P1-6: connect succeeded — wait briefly for the first server event to
+    # confirm true connectivity (the WS handshake alone doesn't validate
+    # API-key acceptance; some backends only reject after the first frame).
+    first_event_status = _PASS
+    first_event_message = "Backend WS connected and received first server event within timeout"
+    first_event_remediation: Optional[str] = None
+    events_iter = None
+    try:
+        # Prefer .events() (explicit async-iter method used by some backends);
+        # fall back to .recv_events() which the Protocol defines.
+        get_events = getattr(backend, "events", None) or getattr(
+            backend, "recv_events", None
+        )
+        if get_events is not None:
+            events_iter = get_events()
+            # events_iter may be an async iterator or a coroutine returning one.
+            if asyncio.iscoroutine(events_iter):
+                events_iter = await events_iter
+            try:
+                await asyncio.wait_for(
+                    events_iter.__anext__(), timeout=2.0
+                )
+            except (asyncio.TimeoutError, StopAsyncIteration):
+                first_event_status = _WARN
+                first_event_message = (
+                    "Backend WS connected but no server events received "
+                    "within 2s (soft warning — session may still work)"
+                )
+                first_event_remediation = None
+    except Exception as exc:  # noqa: BLE001
+        # Any exception from events() itself — treat as a soft warning since
+        # connect() already succeeded.
+        first_event_status = _WARN
+        first_event_message = (
+            f"Backend WS connected but events iterator raised: {exc}"
+        )
+
+    # Close and report.
     try:
         await asyncio.wait_for(backend.close(), timeout=2.0)
     except Exception:  # noqa: BLE001
         pass
     return {
-        "status": _PASS,
-        "message": "Backend WS connected successfully within timeout",
-        "remediation": None,
+        "status": first_event_status,
+        "message": first_event_message,
+        "remediation": first_event_remediation,
     }
 
 
-def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
+def _backend_connectivity_pregate(
+    cfg: Any, probe: bool
+) -> tuple[bool, List[Dict[str, Any]]]:
+    """Shared pre-probe gate for the connectivity category.
+
+    Returns ``(should_probe, pre_checks)``. When ``should_probe`` is False,
+    ``pre_checks`` contains the single skip/fail record to surface; when True,
+    the caller is expected to run the actual probe and append its result.
+    """
     mode = getattr(cfg, "mode", "cascaded")
     if mode != "realtime":
-        return [
+        return False, [
             _check(
                 "backend_connectivity",
                 "realtime_probe",
@@ -398,7 +489,7 @@ def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
             )
         ]
     if not probe:
-        return [
+        return False, [
             _check(
                 "backend_connectivity",
                 "realtime_probe",
@@ -410,7 +501,7 @@ def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
     provider = (getattr(cfg, "realtime_provider", "") or "").lower()
     # Required key must be present to even attempt.
     if "gemini" in provider and not os.environ.get("GEMINI_API_KEY"):
-        return [
+        return False, [
             _check(
                 "backend_connectivity",
                 "realtime_probe",
@@ -420,7 +511,7 @@ def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
             )
         ]
     if "openai" in provider and not os.environ.get("OPENAI_API_KEY"):
-        return [
+        return False, [
             _check(
                 "backend_connectivity",
                 "realtime_probe",
@@ -429,14 +520,13 @@ def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
                 "Set OPENAI_API_KEY in ~/.hermes/.env",
             )
         ]
-    try:
-        res = asyncio.run(_probe_backend_async(cfg, timeout=5.0))
-    except Exception as exc:  # noqa: BLE001
-        res = {
-            "status": _FAIL,
-            "message": f"Probe dispatcher raised: {exc}",
-            "remediation": None,
-        }
+    return True, []
+
+
+def _connectivity_record_from_probe(
+    cfg: Any, res: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    provider = (getattr(cfg, "realtime_provider", "") or "").lower()
     return [
         _check(
             "backend_connectivity",
@@ -448,21 +538,76 @@ def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
     ]
 
 
+def _backend_connectivity_checks(cfg: Any, probe: bool) -> List[Dict[str, Any]]:
+    """Sync wrapper: never runs the probe inside a running event loop.
+
+    When called from a running event loop and ``probe`` is True we skip the
+    probe with a clear remediation message — callers who want the probe from
+    async context must use :func:`run_doctor_async`.
+    """
+    should_probe, pre = _backend_connectivity_pregate(cfg, probe)
+    if not should_probe:
+        return pre
+    try:
+        asyncio.get_running_loop()
+        running = True
+    except RuntimeError:
+        running = False
+    if running:
+        return [
+            _check(
+                "backend_connectivity",
+                "realtime_probe",
+                _SKIP,
+                "skipped — cannot run probe synchronously inside a running "
+                "event loop (use run_doctor_async)",
+                None,
+            )
+        ]
+    try:
+        res = asyncio.run(_probe_backend_async(cfg, timeout=5.0))
+    except Exception as exc:  # noqa: BLE001
+        res = {
+            "status": _FAIL,
+            "message": f"Probe dispatcher raised: {exc}",
+            "remediation": None,
+        }
+    return _connectivity_record_from_probe(cfg, res)
+
+
+async def _backend_connectivity_checks_async(
+    cfg: Any, probe: bool
+) -> List[Dict[str, Any]]:
+    """Async variant: awaits the probe directly in the current event loop."""
+    should_probe, pre = _backend_connectivity_pregate(cfg, probe)
+    if not should_probe:
+        return pre
+    try:
+        res = await _probe_backend_async(cfg, timeout=5.0)
+    except Exception as exc:  # noqa: BLE001
+        res = {
+            "status": _FAIL,
+            "message": f"Probe dispatcher raised: {exc}",
+            "remediation": None,
+        }
+    return _connectivity_record_from_probe(cfg, res)
+
+
 # ---------------------------------------------------------------------------
 # Runner + formatters
 # ---------------------------------------------------------------------------
 
 
-def run_doctor(probe: bool = True) -> Dict[str, Any]:
-    """Run all checks and return a structured report."""
-    checks: List[Dict[str, Any]] = []
-    # Lazy import so `from hermes_s2s.doctor import run_doctor` stays cheap.
+def _load_cfg_for_doctor() -> tuple[Any, Optional[List[Dict[str, Any]]]]:
+    """Try to load the S2S config; on failure return the single-check fail
+    list so callers can short-circuit with a fail overall_status.
+    """
     try:
         from hermes_s2s.config import load_config
 
-        cfg = load_config()
+        return load_config(), None
     except Exception as exc:  # noqa: BLE001
-        checks.append(
+        return None, [
             _check(
                 "configuration",
                 "load_config",
@@ -470,25 +615,78 @@ def run_doctor(probe: bool = True) -> Dict[str, Any]:
                 f"Could not load ~/.hermes/config.yaml: {exc}",
                 "Run `hermes s2s setup` to create a valid config",
             )
-        )
-        return {"overall_status": _FAIL, "checks": checks}
+        ]
 
+
+def _collect_non_connectivity_checks(cfg: Any) -> List[Dict[str, Any]]:
+    checks: List[Dict[str, Any]] = []
     checks.extend(_configuration_checks(cfg))
     checks.extend(_python_dep_checks())
     checks.extend(_system_dep_checks())
     checks.extend(_api_key_checks(cfg))
     checks.extend(_hermes_integration_checks(cfg))
-    checks.extend(_backend_connectivity_checks(cfg, probe=probe))
+    return checks
 
+
+def _overall_status(checks: List[Dict[str, Any]]) -> str:
     # Overall: fail > warn > pass (ignore skip).
     overall = _PASS
     for c in checks:
         if c["status"] == _FAIL:
-            overall = _FAIL
-            break
+            return _FAIL
         if c["status"] == _WARN:
             overall = _WARN
-    return {"overall_status": overall, "checks": checks}
+    return overall
+
+
+def run_doctor_sync(probe: bool = False) -> Dict[str, Any]:
+    """Synchronous doctor runner.
+
+    The probe cannot be executed from inside a running event loop; this
+    function either runs it via ``asyncio.run`` (when no loop is active)
+    or surfaces a skip with a helpful remediation message. Prefer
+    :func:`run_doctor_async` from async contexts (gateway tool handlers).
+    """
+    cfg, early_fail = _load_cfg_for_doctor()
+    if early_fail is not None:
+        return {"overall_status": _FAIL, "checks": early_fail}
+    checks = _collect_non_connectivity_checks(cfg)
+    checks.extend(_backend_connectivity_checks(cfg, probe=probe))
+    return {"overall_status": _overall_status(checks), "checks": checks}
+
+
+async def run_doctor_async(probe: bool = True) -> Dict[str, Any]:
+    """Async doctor runner.
+
+    Runs the non-IO checks synchronously (they're cheap) and awaits the
+    connectivity probe directly in the caller's loop — this is the path
+    used by :mod:`hermes_s2s.tools` when invoked from the Hermes gateway,
+    which is always inside a running event loop.
+    """
+    cfg, early_fail = _load_cfg_for_doctor()
+    if early_fail is not None:
+        return {"overall_status": _FAIL, "checks": early_fail}
+    checks = _collect_non_connectivity_checks(cfg)
+    checks.extend(await _backend_connectivity_checks_async(cfg, probe=probe))
+    return {"overall_status": _overall_status(checks), "checks": checks}
+
+
+def run_doctor(probe: bool = True) -> Dict[str, Any]:
+    """Backward-compatible wrapper.
+
+    * Outside a running event loop: delegates to ``run_doctor_async`` via
+      ``asyncio.run`` so the probe behaves as before.
+    * Inside a running event loop: raises ``RuntimeError`` — the caller
+      must be migrated to ``run_doctor_async``.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run_doctor_async(probe=probe))
+    raise RuntimeError(
+        "run_doctor() cannot be called from inside a running event loop; "
+        "use `await hermes_s2s.doctor.run_doctor_async(probe=...)` instead"
+    )
 
 
 def _paint(s: str, color: str, tty: bool) -> str:

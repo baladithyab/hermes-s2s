@@ -319,8 +319,10 @@ class OpenAIRealtimeBackend:
             {
                 "type": "response.create",
                 "response": {
+                    "conversation": "none",
+                    "output_modalities": ["audio"],
+                    "modalities": ["audio"],  # legacy field, harmless
                     "instructions": f"Briefly say: {text}",
-                    "modalities": ["audio"],
                 },
             }
         )

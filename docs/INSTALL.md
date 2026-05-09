@@ -6,17 +6,21 @@ for your OS, then verify with `hermes s2s doctor`. The full happy path is
 
 ## Pip install profiles
 
+> **Note**: Until we publish to PyPI, each `pip install ...` below must include
+> the suffix `@ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2` after
+> the extras spec. Once we publish to PyPI, drop the `@ git+...@v0.3.2` suffix.
+
 | Profile | What you get | Install command |
 |---|---|---|
-| `core` | Plugin scaffold + command-provider STT/TTS shims | `pip install hermes-s2s` |
-| `audio` | + `scipy` for non-16 kHz resampling | `pip install 'hermes-s2s[audio]'` |
-| `moonshine` | + Moonshine STT (ONNX, local) | `pip install 'hermes-s2s[moonshine]'` |
-| `kokoro` | + Kokoro TTS (local) | `pip install 'hermes-s2s[kokoro]'` |
-| `local-all` | Moonshine + Kokoro + `scipy` | `pip install 'hermes-s2s[local-all]'` |
-| `realtime` | + `websockets` for Gemini Live / OpenAI Realtime | `pip install 'hermes-s2s[realtime]'` |
-| `server-client` | + `websockets` for the external s2s-server | `pip install 'hermes-s2s[server-client]'` |
-| `all` | Everything above in one shot | `pip install 'hermes-s2s[all]'` |
-| `dev` | + pytest + ruff (for contributors) | `pip install 'hermes-s2s[dev]'` |
+| `core` | Plugin scaffold + command-provider STT/TTS shims | `pip install 'hermes-s2s @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `audio` | + `scipy` for non-16 kHz resampling | `pip install 'hermes-s2s[audio] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `moonshine` | + Moonshine STT (ONNX, local) | `pip install 'hermes-s2s[moonshine] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `kokoro` | + Kokoro TTS (local) | `pip install 'hermes-s2s[kokoro] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `local-all` | Moonshine + Kokoro + `scipy` | `pip install 'hermes-s2s[local-all] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `realtime` | + `websockets` for Gemini Live / OpenAI Realtime | `pip install 'hermes-s2s[realtime] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `server-client` | + `websockets` for the external s2s-server | `pip install 'hermes-s2s[server-client] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `all` | Everything above in one shot | `pip install 'hermes-s2s[all] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
+| `dev` | + pytest + ruff (for contributors) | `pip install 'hermes-s2s[dev] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'` |
 
 If you're new, pick `all` — it's the only profile that lets every `hermes s2s
 setup --profile <x>` work without a follow-up `pip install`.

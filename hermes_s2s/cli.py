@@ -111,6 +111,11 @@ def _print_realtime_checklist(profile: str) -> None:
         f"  {_mark(ok_discord)} python 'import discord' — "
         "pip install hermes-agent[messaging]"
     )
+    ok_ws = importlib.util.find_spec("websockets") is not None
+    print(
+        f"  {_mark(ok_ws)} python 'import websockets' — "
+        "pip install 'hermes-s2s[realtime]'"
+    )
 
 
 def _append_monkeypatch_env(env_path: Path) -> bool:
@@ -416,3 +421,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(format_human(report))
     sys.exit(0 if report["overall_status"] != "fail" else 1)
 # ----- end G3 -------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Standalone argparse for `python -m hermes_s2s.cli ...` invocations.
+
+    The Hermes `hermes s2s ...` entry point registers subcommands via
+    ``register_argparse``/``dispatch`` directly, so this parser only exists
+    so devs can sanity-test the same handlers from the repo without a
+    Hermes install.
+    """
+    p = argparse.ArgumentParser(prog="python -m hermes_s2s.cli")
+    register_argparse(p) if "register_argparse" in globals() else None
+    return p
+
+
+if __name__ == "__main__":
+    # Lightweight standalone CLI: route doctor + setup + status through dispatch().
+    parser = argparse.ArgumentParser(prog="python -m hermes_s2s.cli")
+    subs = parser.add_subparsers(dest="s2s_command")
+    p_setup = subs.add_parser("setup")
+    p_setup.add_argument("--profile")
+    p_setup.add_argument("--config-path")
+    p_setup.add_argument("--dry-run", action="store_true")
+    p_doctor = subs.add_parser("doctor")
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.add_argument("--no-probe", action="store_true")
+    p_mode = subs.add_parser("mode")
+    p_mode.add_argument("mode")
+    p_test = subs.add_parser("test")
+    p_test.add_argument("--text", default="hello")
+    subs.add_parser("status")
+    args = parser.parse_args()
+    dispatch(args)

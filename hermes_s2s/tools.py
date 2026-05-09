@@ -40,7 +40,7 @@ def s2s_status(args: dict, **kwargs: Any) -> str:
     active_mode = _resolve_active_mode(session_id)
     registered = list_registered()
 
-    return _ok_json({
+    result: dict[str, Any] = {
         "active_mode": active_mode,
         "config_mode": cfg.mode,
         "session_overridden": session_id in _SESSION_MODE_OVERRIDE,
@@ -68,7 +68,23 @@ def s2s_status(args: dict, **kwargs: Any) -> str:
             "websockets": _module_available("websockets"),
             "ffmpeg_in_path": shutil.which("ffmpeg") is not None,
         },
-    })
+    }
+
+    # P1-2: surface RealtimeAudioBridge.stats() when a bridge is active.
+    try:
+        from hermes_s2s._internal.audio_bridge import get_active_bridge
+
+        bridge = get_active_bridge()
+        if bridge is not None:
+            try:
+                result["bridge_stats"] = bridge.stats()
+            except Exception as exc:  # noqa: BLE001
+                result["bridge_stats_error"] = str(exc)
+    except Exception:  # noqa: BLE001
+        # audio_bridge import path is always present but be defensive.
+        pass
+
+    return _ok_json(result)
 
 
 def _module_available(name: str) -> bool:
@@ -119,19 +135,25 @@ def s2s_test_pipeline(args: dict, **kwargs: Any) -> str:
     })
 
 
-def s2s_doctor(args: dict, **kwargs: Any) -> str:
+async def s2s_doctor(args: dict, **kwargs: Any) -> str:
     """LLM-callable: run the full pre-flight readiness check.
 
-    Delegates to ``hermes_s2s.doctor.run_doctor``. The ``probe`` arg (default
-    True) controls whether to open a 5s WS probe to the configured realtime
-    backend; set to False in CI or to avoid the ~$0.0001 probe cost.
+    Delegates to :func:`hermes_s2s.doctor.run_doctor_async`. The ``probe`` arg
+    (default True) controls whether to open a 5 s WS probe to the configured
+    realtime backend; set to False in CI or to avoid the ~$0.0001 probe cost.
+
+    This handler is **async** (P0-1): the Hermes gateway invokes tool
+    handlers inside a running event loop, so a synchronous ``asyncio.run``
+    inside the probe would raise
+    ``RuntimeError: asyncio.run() cannot be called from a running event loop``.
     """
     probe = True
     if isinstance(args, dict) and "probe" in args:
         probe = bool(args.get("probe"))
-    from .doctor import run_doctor
+    from .doctor import run_doctor_async
 
-    return json.dumps(run_doctor(probe=probe), default=str)
+    report = await run_doctor_async(probe=probe)
+    return json.dumps(report, default=str)
 
 
 # ---------------------------------------------------------------------------

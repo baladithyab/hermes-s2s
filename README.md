@@ -8,7 +8,7 @@ Hermes ships built-in voice mode with a fixed cascaded STT → LLM → TTS pipel
 
 - **Realtime duplex backends** — Gemini Live, GPT-4o Realtime / gpt-4o-mini-realtime
 - **Per-stage configurability** — local STT + cloud LLM + local TTS, any combination
-- **Local pipeline integration** — wraps your own [streaming-speech-to-speech](https://github.com/codeseys/streaming-speech-to-speech) (or compatible) server as a one-shot duplex backend
+- **Local pipeline integration** — wraps your own [streaming-speech-to-speech](https://huggingface.co/spaces/Codeseys/streaming-speech-to-speech-demo) (or compatible) server as a one-shot duplex backend
 - **Provider registry** — Moonshine, Kokoro, faster-whisper, ElevenLabs, OpenAI, Groq, and any custom CLI-wrapped provider
 - **Modes** — `cascaded` (STT-then-LLM-then-TTS), `realtime` (native duplex WS), `s2s-server` (full-pipeline external server)
 
@@ -26,7 +26,7 @@ Forking Hermes for this would diverge the codebase. A plugin opts users in clean
 ## 30-second install
 
 ```bash
-pip install 'hermes-s2s[all]'
+pip install 'hermes-s2s[all] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'
 hermes plugins enable hermes-s2s
 hermes s2s setup --profile realtime-gemini
 hermes s2s doctor

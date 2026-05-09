@@ -217,15 +217,38 @@ def test_setup_realtime_idempotent_env_append(tmp_path, monkeypatch):
 
 
 def test_setup_realtime_warns_on_missing_api_key(capsys, tmp_path, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # Run twice: once with the key set, once unset. Diff the [✓]/[✗] mark on
+    # the GEMINI_API_KEY line to prove the warning actually reflects state
+    # (a substring like "GEMINI_API_KEY" alone is printed regardless).
     monkeypatch.setenv("HOME", str(tmp_path))
     args = _make_args(
         profile="realtime-gemini",
         dry_run=True,
         config_path=str(tmp_path / "config.yaml"),
     )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-set")
     cli.cmd_setup(args)
-    out = capsys.readouterr().out
-    assert "GEMINI_API_KEY" in out
-    assert "aistudio.google.com" in out
+    out_set = capsys.readouterr().out
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    cli.cmd_setup(args)
+    out_unset = capsys.readouterr().out
+
+    # Both runs print the readiness checklist mentioning the env var name +
+    # remediation URL, so those substrings appear in BOTH outputs.
+    assert "GEMINI_API_KEY" in out_set
+    assert "GEMINI_API_KEY" in out_unset
+    assert "aistudio.google.com" in out_unset
+
+    # The actual differentiator is the unicode mark next to the line:
+    # set -> [✓], unset -> [✗]. Find each and assert the mark differs.
+    def _mark_for_line(text: str, label: str) -> str:
+        for line in text.splitlines():
+            if label in line and ("[\u2713]" in line or "[\u2717]" in line):
+                return "set" if "[\u2713]" in line else "unset"
+        return "missing"
+
+    assert _mark_for_line(out_set, "GEMINI_API_KEY") == "set"
+    assert _mark_for_line(out_unset, "GEMINI_API_KEY") == "unset"
 

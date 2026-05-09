@@ -326,7 +326,18 @@ async def test_send_filler_audio_emits_response_create(mock_ws_server):
     assert rc_idx > 0
 
     response = rc.get("response") or {}
-    assert response.get("modalities") == ["audio"]
+    assert response.get("conversation") == "none", (
+        "OOB responses (out-of-band, not added to history) REQUIRE "
+        "conversation='none' per GA gpt-realtime docs"
+    )
+    # GA field is 'output_modalities'; legacy field 'modalities' is kept for
+    # back-compat with older server revisions. Either must be present + audio.
+    assert (
+        "output_modalities" in response or "modalities" in response
+    ), response
+    assert response.get("output_modalities") == ["audio"] or response.get(
+        "modalities"
+    ) == ["audio"]
     assert "thinking" in response.get("instructions", "")
 
     await backend.close()

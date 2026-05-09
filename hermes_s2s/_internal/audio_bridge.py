@@ -54,6 +54,38 @@ _DEFAULT_BACKEND_OUTPUT_RATE = 24000
 INPUT_QUEUE_MAX = 50
 
 
+# ---------------------------------------------------------------------------
+# Active-bridge registry (P1-2).
+#
+# The Hermes gateway has no direct access to the ``RealtimeAudioBridge``
+# instance created deep inside ``discord_bridge.py``. A module-level
+# registry is the narrowest seam that lets the ``s2s_status`` LLM tool
+# surface ``bridge.stats()`` without plumbing an extra argument through
+# every layer. Guarded by a threading.Lock because ``start()`` runs in an
+# asyncio loop but ``get_active_bridge()`` may be called from any thread
+# (including the Discord player thread).
+# ---------------------------------------------------------------------------
+_ACTIVE_BRIDGE: "Optional[RealtimeAudioBridge]" = None
+_ACTIVE_BRIDGE_LOCK = threading.Lock()
+
+
+def get_active_bridge() -> "Optional[RealtimeAudioBridge]":
+    """Return the currently-active ``RealtimeAudioBridge``, or ``None``.
+
+    There is at most ONE active bridge per process (realtime voice is
+    single-call in 0.3.2 — see README §Known issues). Returns ``None``
+    before ``start()`` completes or after ``close()`` has cleared the slot.
+    """
+    with _ACTIVE_BRIDGE_LOCK:
+        return _ACTIVE_BRIDGE
+
+
+def _set_active_bridge(bridge: "Optional[RealtimeAudioBridge]") -> None:
+    global _ACTIVE_BRIDGE
+    with _ACTIVE_BRIDGE_LOCK:
+        _ACTIVE_BRIDGE = bridge
+
+
 class BridgeBuffer:
     """Thread-safe audio bridge buffer.
 
@@ -87,7 +119,12 @@ class BridgeBuffer:
         self._underflows = 0
         self._output_drops = 0
         # G3 (BACKLOG-0.3.2 F5): debounced warn + per-frame emission counters.
+        # P2-fix-B: use a monotonically-advancing next-warn threshold rather
+        # than a modulo check, so the warn fires reliably even if multiple
+        # drops land in the same ``push_input`` call (the modulo variant would
+        # skip the boundary when counters leapt from e.g. 99 to 101).
         self._dropped_input_warn_threshold = 100
+        self._next_drop_warn_at = self._dropped_input_warn_threshold
         self._frames_emitted = 0
         self._frames_underflow = 0
 
@@ -107,34 +144,28 @@ class BridgeBuffer:
             try:
                 self._input_q.get_nowait()
                 self._dropped_input += 1
-                if (
-                    self._dropped_input
-                    % self._dropped_input_warn_threshold
-                    == 0
-                ):
-                    logger.warning(
-                        "BridgeBuffer: %d input frames dropped so far "
-                        "(queue capacity=%d)",
-                        self._dropped_input,
-                        self._input_max,
-                    )
+                self._maybe_warn_dropped_input()
             except queue.Empty:  # pragma: no cover - race
                 pass
             try:
                 self._input_q.put_nowait((user_id, pcm))
             except queue.Full:  # pragma: no cover - pathological
                 self._dropped_input += 1
-                if (
-                    self._dropped_input
-                    % self._dropped_input_warn_threshold
-                    == 0
-                ):
-                    logger.warning(
-                        "BridgeBuffer: %d input frames dropped so far "
-                        "(queue capacity=%d)",
-                        self._dropped_input,
-                        self._input_max,
-                    )
+                self._maybe_warn_dropped_input()
+
+    def _maybe_warn_dropped_input(self) -> None:
+        """P2-fix-B: emit a warning each time ``_dropped_input`` crosses the
+        next debounce boundary. Monotonically advances the threshold so
+        missed boundaries (race between two +=1 bumps) still fire once.
+        """
+        while self._dropped_input >= self._next_drop_warn_at:
+            logger.warning(
+                "BridgeBuffer: %d input frames dropped so far "
+                "(queue capacity=%d)",
+                self._dropped_input,
+                self._input_max,
+            )
+            self._next_drop_warn_at += self._dropped_input_warn_threshold
 
     async def pop_input(
         self, poll_interval: float = 0.005
@@ -341,6 +372,9 @@ class RealtimeAudioBridge:
         self._task = asyncio.create_task(
             self._bridge_loop(), name="hermes-s2s.bridge_loop"
         )
+        # P1-2: publish this bridge as the active one so s2s_status can
+        # surface bridge.stats() via ``get_active_bridge()``.
+        _set_active_bridge(self)
 
     async def close(self) -> None:
         """Cancel the bridge loop, close the backend. Idempotent."""
@@ -387,6 +421,11 @@ class RealtimeAudioBridge:
                     await res
             except Exception:  # noqa: BLE001
                 logger.exception("backend close raised")
+        # P1-2: clear the active-bridge slot if it still points at us (a
+        # newer bridge may already have replaced it in a hypothetical
+        # multi-call future).
+        if get_active_bridge() is self:
+            _set_active_bridge(None)
 
     def on_user_frame(self, user_id: int, pcm: bytes) -> None:
         """Called from the Discord receive thread. Thread-safe & non-blocking."""

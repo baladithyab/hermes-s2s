@@ -134,10 +134,30 @@ def test_run_doctor_with_probe_mocked_websocket(
     )
     monkeypatch.setenv("GEMINI_API_KEY", "sk-fake-" + "x" * 30)
 
-    # Mock resolve_realtime to return a fake backend that connects successfully.
+    # Mock resolve_realtime to return a fake backend that connects successfully
+    # AND produces at least one event (so the first-event wait in P1-6 resolves
+    # cleanly and we get a 'pass' rather than 'warn').
     fake_backend = MagicMock()
     fake_backend.connect = AsyncMock(return_value=None)
     fake_backend.close = AsyncMock(return_value=None)
+
+    class _OneEventIter:
+        def __init__(self) -> None:
+            self._yielded = False
+
+        def __aiter__(self) -> "_OneEventIter":
+            return self
+
+        async def __anext__(self) -> Any:
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            ev = MagicMock()
+            ev.type = "session.created"
+            ev.payload = {}
+            return ev
+
+    fake_backend.recv_events = MagicMock(return_value=_OneEventIter())
 
     import hermes_s2s.registry as reg
 
@@ -148,3 +168,26 @@ def test_run_doctor_with_probe_mocked_websocket(
     assert bc, "expected backend_connectivity check"
     assert any(c["status"] == "pass" for c in bc), bc
     fake_backend.connect.assert_awaited()
+
+
+# ---------- g. run_doctor_async works inside a running event loop (P0-1) ----------
+
+
+@pytest.mark.asyncio
+async def test_run_doctor_async_works_inside_running_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: the Hermes gateway always awaits tool handlers inside a
+    running event loop. `run_doctor_async(probe=False)` must return a report
+    with a valid overall_status without raising
+    ``RuntimeError: asyncio.run() cannot be called from a running loop``.
+    """
+    from hermes_s2s.doctor import run_doctor_async
+
+    _install_tmp_config(monkeypatch, tmp_path, {"mode": "cascaded"})
+    report = await run_doctor_async(probe=False)
+    assert report["overall_status"] in ("pass", "warn", "fail")
+    # And the fully-qualified category set is still populated.
+    cats = {c["category"] for c in report["checks"]}
+    assert "configuration" in cats
+    assert "backend_connectivity" in cats

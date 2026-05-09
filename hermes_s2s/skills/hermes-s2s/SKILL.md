@@ -146,7 +146,7 @@ brew install espeak-ng           # (macOS)
 
 ### "Realtime mode not implemented yet"
 
-That's expected only if your plugin is older than 0.3.1 — the realtime Discord audio bridge shipped in 0.3.1. Upgrade to 0.3.1+ and set `HERMES_S2S_MONKEYPATCH_DISCORD=1` (see HOWTO-REALTIME-DISCORD.md) to route Discord VC audio through Gemini Live / OpenAI Realtime. The realtime backend classes themselves (`gemini-live`, `gpt-realtime-mini`) work today for non-Discord use cases too (CLI, tests, future platforms). Track progress at https://github.com/codeseys/hermes-s2s. Use `cascaded` or `s2s-server` for Discord voice if you can't upgrade.
+That's expected only if your plugin is older than 0.3.1 — the realtime Discord audio bridge shipped in 0.3.1. Upgrade to 0.3.1+ and set `HERMES_S2S_MONKEYPATCH_DISCORD=1` (see HOWTO-REALTIME-DISCORD.md) to route Discord VC audio through Gemini Live / OpenAI Realtime. The realtime backend classes themselves (`gemini-live`, `gpt-realtime-mini`) work today for non-Discord use cases too (CLI, tests, future platforms). Track progress at https://github.com/baladithyab/hermes-s2s. Use `cascaded` or `s2s-server` for Discord voice if you can't upgrade.
 
 ## Architecture (one paragraph)
 

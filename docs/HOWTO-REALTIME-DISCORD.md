@@ -109,7 +109,7 @@ plugins:
    ~2 s. Speak a short prompt. Response audio plays back through the VC
    within 1–2 s. `/voice leave` → bot disconnects cleanly.
 
-Full step-by-step walkthrough in [scripts/smoke_discord.md](https://github.com/codeseys/hermes-s2s/blob/main/scripts/smoke_discord.md).
+Full step-by-step walkthrough in [scripts/smoke_discord.md](https://github.com/baladithyab/hermes-s2s/blob/main/scripts/smoke_discord.md).
 
 ## Troubleshooting
 
@@ -125,7 +125,7 @@ Full step-by-step walkthrough in [scripts/smoke_discord.md](https://github.com/c
 
 ## Latency expectations
 
-From [research/02-realtime-apis.md §cost+latency table](https://github.com/codeseys/hermes-s2s/blob/main/docs/design-history/research/02-realtime-apis.md):
+From [research/02-realtime-apis.md §cost+latency table](https://github.com/baladithyab/hermes-s2s/blob/main/docs/design-history/research/02-realtime-apis.md):
 
 | Backend | Latency (first audio) | $/30 min |
 |---|---|---|
@@ -139,6 +139,6 @@ round-trip. In practice users on a 20 ms home-broadband RTT report
 
 ## Reporting bugs
 
-https://github.com/codeseys/hermes-s2s/issues — include the output of
+https://github.com/baladithyab/hermes-s2s/issues — include the output of
 `scripts/smoke_realtime.py` for the same provider so we can tell backend
 issues from bridge issues.

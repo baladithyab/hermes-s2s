@@ -49,7 +49,7 @@ class S2SServerPipeline:
             "s2s-server pipeline backend is not implemented yet. "
             "Run your streaming-speech-to-speech server independently for now and "
             "use stage-only mode (stt.provider: s2s-server / tts.provider: s2s-server). "
-            "Track progress at https://github.com/codeseys/hermes-s2s."
+            "Track progress at https://github.com/baladithyab/hermes-s2s."
         )
 
 

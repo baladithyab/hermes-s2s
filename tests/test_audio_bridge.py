@@ -360,7 +360,13 @@ def test_on_user_frame_thread_safe() -> None:
 
 
 def test_buffer_logs_warning_every_100_drops(caplog: Any) -> None:
-    """push_input more than 200 overflows -> WARNING logged at 100 + 200."""
+    """push_input more than 200 overflows -> WARNING logged at 100 + 200.
+
+    P2-fix-B: the old modulo-based debounce could skip the 100/200 boundary
+    if two drops landed in the same push_input call (the counter would jump
+    from 99 to 101 and the modulo check ``== 0`` would never fire). The new
+    threshold-based check fires when the counter *crosses* each boundary.
+    """
     import logging
 
     buf = BridgeBuffer(input_max=1)
@@ -373,8 +379,14 @@ def test_buffer_logs_warning_every_100_drops(caplog: Any) -> None:
     # input_max=1 + 250 pushes: each overflow drops one, so the first push is
     # accepted and subsequent 249 trigger drops. We expect warns at 100 and 200.
     assert len(warn_msgs) >= 2, f"expected at least 2 warnings, got {warn_msgs}"
+    # MUST contain the 100-boundary message (not 99 and not 101).
     assert any("100 input frames dropped" in m for m in warn_msgs), warn_msgs
     assert any("200 input frames dropped" in m for m in warn_msgs), warn_msgs
+    # MUST NOT contain off-by-one messages.
+    assert not any("99 input frames dropped" in m for m in warn_msgs), warn_msgs
+    assert not any(
+        "199 input frames dropped" in m for m in warn_msgs
+    ), warn_msgs
 
 
 def test_buffer_stats_returns_expected_keys() -> None:
@@ -412,3 +424,29 @@ def test_bridge_stats_aggregates() -> None:
     # Bridge-level augmentation present.
     assert "backend_input_rate" in s
     assert "backend_output_rate" in s
+
+
+# ---------- p1-2. get_active_bridge() registry ----------
+
+def test_get_active_bridge_returns_bridge_after_start() -> None:
+    """`s2s_status` reads the active bridge via this registry; verify it
+    actually flips on start() and clears on close()."""
+    from hermes_s2s._internal.audio_bridge import get_active_bridge
+
+    async def scenario() -> None:
+        # Clear any prior state from sibling tests in the same process.
+        assert get_active_bridge() is None or get_active_bridge() is not None
+        backend = _make_backend(events=[])
+        bridge = RealtimeAudioBridge(backend=backend)
+        await bridge.start()
+        try:
+            assert get_active_bridge() is bridge, (
+                "start() should set the module-level active bridge"
+            )
+        finally:
+            await bridge.close()
+        assert get_active_bridge() is None, (
+            "close() should clear the active bridge registry"
+        )
+
+    asyncio.run(scenario())

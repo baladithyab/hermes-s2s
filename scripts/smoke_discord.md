@@ -104,7 +104,7 @@ player — you should hear the bot reading the assistant response.
 
 ## How to report bugs
 
-Open an issue at **https://github.com/codeseys/hermes-s2s/issues** with:
+Open an issue at **https://github.com/baladithyab/hermes-s2s/issues** with:
 
 1. The exact command/config that reproduces (redact keys).
 2. Hermes Agent version (`hermes --version`) + hermes-s2s version (`hermes s2s status`).
