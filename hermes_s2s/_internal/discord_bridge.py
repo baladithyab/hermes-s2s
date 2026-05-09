@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # will tighten as we test; the upper bound exists so that a future breaking
 # refactor in gateway/platforms/discord.py surfaces as a clear error instead
 # of a silent broken patch. Inclusive on both ends.
-SUPPORTED_HERMES_RANGE: Tuple[str, str] = ("0.0.0", "999.0.0")
+SUPPORTED_HERMES_RANGE: Tuple[str, str] = ("0.0.0", "999.0.0")  # TODO: tighten upper bound after testing against Hermes 1.x release
 
 _ENV_FLAG = "HERMES_S2S_MONKEYPATCH_DISCORD"
 _UPSTREAM_PR_URL = (
@@ -240,17 +240,18 @@ def _install_bridge_on_adapter(adapter: Any, channel: Any) -> None:
         )
         return
 
-    # Pause Hermes's default VoiceReceiver so we don't double-transcribe.
-    receivers = getattr(adapter, "_voice_receivers", {}) or {}
-    receiver = receivers.get(guild_id) if guild_id is not None else None
-    if receiver is not None:
-        try:
-            receiver.pause()
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.debug("hermes-s2s: receiver.pause() failed: %s", exc)
-
+    # NOTE: do NOT pause Hermes's default VoiceReceiver here. In 0.3.0 the audio
+    # bridge is a no-op stub — pausing the receiver without replacing the audio
+    # loop would silently mute the bot. Hermes's built-in STT -> text -> TTS path
+    # stays active so the user keeps a working voice experience. The receiver
+    # pause + real PCM<->backend wiring lands together in 0.3.1.
+    logger.warning(
+        "hermes-s2s realtime audio bridge is a 0.3.0 stub — audio will NOT route "
+        "through Gemini Live / OpenAI Realtime yet. The Discord bot will continue "
+        "using Hermes built-in voice. Real audio bridging is 0.3.1."
+    )
     logger.info(
-        "hermes-s2s: would bridge audio here (guild=%s, backend=%s) — 0.3.1 will "
+        "hermes-s2s: realtime bridge configured (guild=%s, backend=%s) — 0.3.1 will "
         "wire PCM <-> realtime backend; shipped as setup-plumbing-only in 0.3.0",
         guild_id,
         getattr(cfg, "realtime", None) and getattr(cfg.realtime, "provider", None),

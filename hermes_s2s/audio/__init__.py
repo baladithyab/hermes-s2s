@@ -1,1 +1,1 @@
-"""Audio resampling + format-conversion utilities (TBD in 0.2.0)."""
+"""Audio resampling + format-conversion utilities (implemented in 0.3.0)."""

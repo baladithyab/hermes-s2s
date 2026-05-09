@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-s2s"
-version = "0.2.0"
+version = "0.3.0"
 description = "Configurable speech-to-speech for Hermes Agent — realtime, cascaded, and local-pipeline backends."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,7 +22,6 @@ dependencies = [
     "pyyaml>=6.0",
     "soundfile>=0.12",
     "numpy>=1.24",
-    "websockets>=12.0",
     "httpx>=0.25",
 ]
 
@@ -33,10 +32,10 @@ moonshine = ["moonshine-onnx>=0.2.0"]
 kokoro = ["kokoro>=0.7.0"]
 # Resampling for non-16kHz inputs
 audio = ["scipy>=1.11"]
-# Realtime backends — uses websockets + httpx (already in core deps)
-realtime = []
-# Server-mode client — uses websockets (already in core deps)
-server-client = []
+# Realtime backends — WebSocket duplex to Gemini Live / OpenAI Realtime
+realtime = ["websockets>=12.0"]
+# Server-mode client — WebSocket client for streaming-speech-to-speech
+server-client = ["websockets>=12.0"]
 # Convenience: full local pipeline
 local-all = ["hermes-s2s[moonshine,kokoro,audio]"]
 # Convenience: full feature set
