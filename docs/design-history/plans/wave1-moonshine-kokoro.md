@@ -39,7 +39,7 @@ The pkg names matter — bad assumption here will sink the wave.
 
 **Kokoro package:** Verified via v6: `from kokoro import KPipeline; KPipeline(lang_code='a')`. Pkg: `kokoro` on PyPI (Apache-2.0, requires espeak-ng for phonemizer — already a Hermes voice-mode system dep for NeuTTS). **HF model:** `hexgrad/Kokoro-82M`. Default voice `af_heart` (Hexgrad-trained American Female).
 
-Both confirmed against user's `/mnt/e/CS/HF/streaming-speech-to-speech/pipelines/v6_final.py` lines 130-170 — exact import shape and usage.
+Both confirmed against user's `https://github.com/codeseys/streaming-speech-to-speech (local checkout) pipelines/v6_final.py` lines 130-170 — exact import shape and usage.
 
 ## Subagent prompts (sketches — actual prompts in the dispatch call)
 

@@ -6,7 +6,7 @@
 
 ## Context
 
-User maintains a production research project at `/mnt/e/CS/HF/streaming-speech-to-speech/` (v6: 212ms best, 239ms median TTFA on A10G). It already has:
+User maintains a production research project at `https://github.com/codeseys/streaming-speech-to-speech (local checkout) ` (v6: 212ms best, 239ms median TTFA on A10G). It already has:
 
 - A complete FastAPI WebSocket server (`server/app/main.py`, `ws.py`, `pipeline.py`).
 - Moonshine + vLLM + Kokoro composition with all v1→v6 optimizations.

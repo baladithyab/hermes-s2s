@@ -3,7 +3,7 @@
 > **2026-05-09 scope-lock.** Three pivots collapsed the project into its real shape:
 > 1. Hermes already ships `/voice join` + multi-provider STT/TTS (`tools/transcription_tools.py`, `tools/tts_tool.py`) → existing voice mode is the seam, not the target.
 > 2. `tts.providers.<name>` with `type: command` is already a CLI escape hatch → command-wrapped providers need **no Python in core**.
-> 3. User has a production local S2S pipeline at `/mnt/e/CS/HF/streaming-speech-to-speech/` (v6: 212ms best, 239ms median TTFA, Moonshine+vLLM+Kokoro). We **wire** it, not rebuild it.
+> 3. User has a production local S2S pipeline at `https://github.com/codeseys/streaming-speech-to-speech (local checkout) ` (v6: 212ms best, 239ms median TTFA, Moonshine+vLLM+Kokoro). We **wire** it, not rebuild it.
 
 ## The S2S backend matrix Hermes should support
 
