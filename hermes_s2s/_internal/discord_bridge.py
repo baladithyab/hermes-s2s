@@ -55,6 +55,13 @@ import logging
 import os
 from typing import Any, Tuple
 
+from hermes_s2s.voice import (
+    CapabilityError,
+    ModeRouter,
+    VoiceMode,
+    VoiceSessionFactory,
+)
+
 logger = logging.getLogger(__name__)
 
 # Hermes versions we've smoke-tested the monkey-patch against. The lower bound
@@ -116,6 +123,85 @@ def _resolve_bridge_params(cfg: Any) -> Tuple[str, Any]:
     )
     voice = provider_block.get("voice", realtime_opts.get("voice"))
     return system_prompt, voice
+
+
+# ---------------------------------------------------------------------------
+# CapabilityError rollback (Phase-8 P1-F7)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_capability_error_rollback(
+    adapter: Any, channel: Any, cap_exc: CapabilityError
+) -> None:
+    """Roll back a VC join when the factory rejected the mode.
+
+    Called from the outermost wrapper of ``join_voice_channel`` when
+    :func:`_install_bridge_on_adapter` raises :class:`CapabilityError`.
+    Responsibilities:
+
+    1. If the VoiceClient for this guild is connected, call
+       ``voice_client.disconnect()`` to roll back.
+    2. Post a user-friendly message to the adapter's bound text channel
+       for this guild (``adapter._voice_text_channels[guild_id]``) when
+       available; fall back to logging otherwise.
+    3. NEVER re-raise — returning normally prevents the exception from
+       propagating into discord.py's callback machinery.
+    """
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+
+    # Roll back the VC connection.
+    voice_clients = getattr(adapter, "_voice_clients", {}) or {}
+    vc = voice_clients.get(guild_id) if guild_id is not None else None
+    if vc is not None:
+        try:
+            is_connected = getattr(vc, "is_connected", None)
+            connected = bool(is_connected()) if callable(is_connected) else True
+            if connected:
+                disconnect = getattr(vc, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        result = disconnect()
+                        if hasattr(result, "__await__"):
+                            await result
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            "hermes-s2s: voice_client.disconnect() raised during "
+                            "CapabilityError rollback: %s",
+                            exc,
+                        )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "hermes-s2s: unexpected error while rolling back VC: %s", exc
+            )
+
+    # Post user-friendly message to the bound text channel, if any.
+    try:
+        text_chans = getattr(adapter, "_voice_text_channels", {}) or {}
+        chat_id = text_chans.get(guild_id) if guild_id is not None else None
+        if chat_id is not None:
+            sender = getattr(adapter, "_send_text", None) or getattr(
+                adapter, "send_text", None
+            )
+            if callable(sender):
+                try:
+                    msg_result = sender(chat_id, cap_exc.user_message())
+                    if hasattr(msg_result, "__await__"):
+                        await msg_result
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "hermes-s2s: failed to post CapabilityError message: %s", exc
+                    )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("hermes-s2s: text-channel notify best-effort failed: %s", exc)
+
+    logger.warning(
+        "hermes-s2s: refused to attach bridge due to CapabilityError "
+        "(mode=%s, missing=%s); VC rolled back. %s",
+        cap_exc.mode.value,
+        cap_exc.missing,
+        cap_exc,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +295,12 @@ def _install_via_monkey_patch(ctx: Any = None) -> None:
         if result:
             try:
                 _install_bridge_on_adapter(self, channel, ctx)
+            except CapabilityError as cap_exc:
+                # Phase-8 P1-F7: the factory refused to build because the
+                # explicitly-requested mode is unavailable. Roll back the
+                # VC join and post a user-friendly message; NEVER let
+                # CapabilityError propagate into discord.py callbacks.
+                await _handle_capability_error_rollback(self, channel, cap_exc)
             except Exception as exc:
                 logger.warning("hermes-s2s: voice bridge attach failed: %s", exc)
         return result
@@ -305,28 +397,40 @@ def _attach_realtime_to_voice_client(
 ) -> None:
     """Wire a :class:`RealtimeAudioBridge` between the Discord VC and the s2s backend.
 
-    Only runs when ``s2s.mode == 'realtime'``; cascaded mode is a no-op so
-    Hermes's built-in STT->text->TTS path stays untouched.
+    Only runs when the resolved :class:`VoiceMode` is ``REALTIME``;
+    cascaded / pipeline / s2s-server modes are either no-ops here
+    (cascaded) or handled by their own session lifecycle (pipeline /
+    s2s-server) — for all non-realtime modes we still register the
+    session on ``adapter._s2s_sessions`` via the factory so the leave-
+    voice-channel wrapper can stop them cleanly.
 
-    Flow (see ADR-0007 + wave-0.3.1 plan B3):
-      1. Load s2s config; bail early if mode != 'realtime'.
-      2. Resolve the realtime backend from the provider registry.
-      3. Build a HermesToolBridge (if ctx exposes ``dispatch_tool``).
-      4. Build a RealtimeAudioBridge wrapping both.
-      5. Install a per-frame PCM callback on the VoiceReceiver (see spike notes
-         at top of this module re: no public hook — we monkey-patch _on_packet).
-      6. Replace whatever the VoiceClient is playing with a QueuedPCMSource fed
-         from the bridge's outbound buffer.
-      7. Schedule ``bridge.start()`` on the voice_client's event loop.
-      8. Track the bridge on ``adapter._s2s_bridges[guild_id]`` for later cleanup.
+    Flow (see ADR-0013 §3 + ADR-0007 + wave-0.3.1 plan B3):
+      1. Load s2s config and resolve the target :class:`ModeSpec` via
+         :class:`ModeRouter`. This supports both the back-compat
+         ``s2s.mode`` key (legacy) and the new ``s2s.voice.default_mode``
+         key the wizard writes.
+      2. Build a HermesToolBridge (if ctx exposes ``dispatch_tool``).
+      3. Delegate construction to :class:`VoiceSessionFactory`.
+         CapabilityError propagates out so the outer wrapper rolls back
+         the VC join (Phase-8 P1-F7).
+      4. If the resulting session is a RealtimeSession, install the
+         frame callback + QueuedPCMSource + silence cascaded STT. Other
+         session types are left to their own ``start()`` to do mode-
+         specific setup.
+      5. Schedule ``session.start()`` on the voice_client's event loop.
+      6. Track the bridge on ``adapter._s2s_bridges[guild_id]`` for
+         legacy leave-voice-channel cleanup (preserved for back-compat).
+
+    v0.3.9 REGRESSION FENCE: the factory's RealtimeSession path calls
+    :func:`_resolve_bridge_params` internally to unwrap the provider
+    sub-block in ``realtime_options``. See ``tests/test_config_unwrap.py``.
     """
     # Lazy imports — these modules live under _internal/ and depend on the
     # optional realtime extras; keeping the import here means this module loads
     # cleanly even if audio_bridge/tool_bridge/discord_audio aren't installable.
     try:
         from ..config import load_config
-        from ..registry import resolve_realtime
-        from .audio_bridge import RealtimeAudioBridge
+        from .. import registry as registry_mod
         from .tool_bridge import HermesToolBridge
         from .discord_audio import QueuedPCMSource
         import asyncio
@@ -343,26 +447,60 @@ def _attach_realtime_to_voice_client(
         logger.warning("hermes-s2s: s2s config load failed: %s", exc)
         return
 
-    mode = str(getattr(cfg, "mode", "") or "").lower()
-    if mode != "realtime":
-        logger.debug(
-            "hermes-s2s: s2s.mode=%r — leaving Hermes's default STT/TTS path untouched",
-            mode,
-        )
-        return
+    # Build a ModeRouter config dict that supports both the back-compat
+    # ``s2s.mode`` key AND the new ``s2s.voice.default_mode`` key. The
+    # legacy string carries through as the default_mode fallback so
+    # existing 0.3.x deployments keep behaving identically.
+    legacy_mode = str(getattr(cfg, "mode", "") or "").strip().lower()
+    router_cfg: dict = {"s2s": {"voice": {}}}
+    # Merge any new-style s2s.voice.* config if the operator wrote it.
+    voice_cfg_obj = getattr(cfg, "voice", None)
+    if isinstance(voice_cfg_obj, dict):
+        router_cfg["s2s"]["voice"].update(voice_cfg_obj)
+    # Legacy s2s.mode wins only if voice.default_mode wasn't set.
+    if legacy_mode and "default_mode" not in router_cfg["s2s"]["voice"]:
+        router_cfg["s2s"]["voice"]["default_mode"] = legacy_mode
+    # Preserve provider info for realtime capability gating.
+    realtime_provider = getattr(cfg, "realtime_provider", None)
+    if realtime_provider:
+        router_cfg["s2s"]["voice"].setdefault("provider", realtime_provider)
 
-    # (b) Resolve backend
+    guild = getattr(voice_client, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    channel_obj = getattr(voice_client, "channel", None)
+    channel_id = getattr(channel_obj, "id", None)
+
     try:
-        backend = resolve_realtime(cfg.realtime_provider, cfg.realtime_options)
+        router = ModeRouter(router_cfg)
+        spec = router.resolve(guild_id=guild_id, channel_id=channel_id)
     except Exception as exc:
-        logger.warning(
-            "hermes-s2s: failed to resolve realtime backend %r: %s",
-            getattr(cfg, "realtime_provider", "?"),
-            exc,
-        )
+        logger.warning("hermes-s2s: ModeRouter.resolve() failed: %s", exc)
         return
 
-    # (c) Tool bridge — only if Hermes ctx exposes dispatch_tool
+    # For cascaded mode, we intentionally don't install a realtime bridge —
+    # Hermes core's native STT/TTS path owns the conversation. Still, we
+    # want the factory to register a CascadedSession so observability +
+    # leave-voice-channel cleanup are symmetric across modes.
+    if spec.mode is VoiceMode.CASCADED:
+        logger.debug(
+            "hermes-s2s: voice mode=%s — leaving Hermes's default STT/TTS path "
+            "untouched (will still register CascadedSession for observability)",
+            spec.mode.value,
+        )
+        try:
+            factory = VoiceSessionFactory(registry=registry_mod)
+            factory.build(spec, voice_client, adapter, ctx)
+        except CapabilityError:
+            # Cascaded has no capability requirements; this should be
+            # unreachable but propagate so the outer wrapper can log.
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: CascadedSession registration failed: %s", exc
+            )
+        return
+
+    # (b) Tool bridge — only if Hermes ctx exposes dispatch_tool
     tool_bridge = None
     if ctx is not None and hasattr(ctx, "dispatch_tool"):
         try:
@@ -371,22 +509,49 @@ def _attach_realtime_to_voice_client(
             logger.warning("hermes-s2s: tool bridge construction failed: %s", exc)
             tool_bridge = None
 
-    # (d) Audio bridge
-    # Pull system_prompt + voice via _resolve_bridge_params, which unwraps the
-    # provider sub-block (realtime_options['gemini_live'] / 'openai') where
-    # the wizard writes the anchored defaults. Outer-level read kept as a
-    # back-compat fallback for pre-0.3.8 flat configs. See
-    # docs/research/10-arabic-language-rootcause.md (Fix A).
-    system_prompt, voice = _resolve_bridge_params(cfg)
-    bridge = RealtimeAudioBridge(
-        backend=backend,
-        tool_bridge=tool_bridge,
-        system_prompt=system_prompt,
-        voice=voice,
-        tools=[],
-    )
+    # (c) Delegate construction to the factory. The factory:
+    #     - runs the capability gate (raises CapabilityError for
+    #       explicit-but-unavailable modes — caught by the outer wrapper);
+    #     - resolves the realtime backend via the registry;
+    #     - calls _resolve_bridge_params() to preserve the v0.3.9 wizard-
+    #       nested-config unwrap behavior;
+    #     - eagerly constructs a RealtimeAudioBridge so we can reach
+    #       session._bridge below for frame-callback / PCM-source wiring.
+    factory = VoiceSessionFactory(registry=registry_mod, tool_bridge=tool_bridge)
+    # CapabilityError intentionally propagates to the outer wrapper.
+    session = factory.build(spec, voice_client, adapter, ctx)
 
-    # (e) Frame callback — see SPIKE notes at top of module re: monkey-patch
+    # Non-realtime sessions (pipeline / s2s-server) — their _on_start
+    # does the mode-specific setup. Schedule start() and return.
+    if spec.mode is not VoiceMode.REALTIME:
+        try:
+            loop = getattr(voice_client, "loop", None)
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(session.start(), loop)
+            else:  # pragma: no cover - defensive
+                logger.warning(
+                    "hermes-s2s: voice_client.loop is None — cannot start %s session",
+                    spec.mode.value,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: scheduling %s session.start() failed: %s",
+                spec.mode.value,
+                exc,
+            )
+        return
+
+    # --- realtime-mode-specific glue below (frame cb + PCM source + TTS silencing) ---
+
+    bridge = getattr(session, "_bridge", None)
+    if bridge is None:
+        logger.warning(
+            "hermes-s2s: RealtimeSession has no _bridge — backend may be "
+            "unresolved; skipping frame/PCM wiring"
+        )
+        return
+
+    # (d) Frame callback — see SPIKE notes at top of module re: monkey-patch
     if voice_receiver is not None:
         try:
             _install_frame_callback(voice_receiver, bridge.on_user_frame)
@@ -395,7 +560,7 @@ def _attach_realtime_to_voice_client(
                 "hermes-s2s: failed to install frame callback on VoiceReceiver: %s", exc
             )
 
-    # (f) Outbound audio — route bridge buffer to the VoiceClient
+    # (e) Outbound audio — route bridge buffer to the VoiceClient
     try:
         if voice_client.is_playing():
             voice_client.stop()
@@ -403,19 +568,22 @@ def _attach_realtime_to_voice_client(
     except Exception as exc:
         logger.warning("hermes-s2s: voice_client.play(QueuedPCMSource) failed: %s", exc)
 
-    # (g) Start the bridge loop on the VC's asyncio loop (thread-safe)
+    # (f) Start the session on the VC's asyncio loop (thread-safe). The
+    # session's connect-before-pumps fence (W1b M1.5) means bridge.start()
+    # doesn't race the backend handshake.
     try:
         loop = getattr(voice_client, "loop", None)
         if loop is not None:
-            asyncio.run_coroutine_threadsafe(bridge.start(), loop)
-        else:  # pragma: no cover — defensive (discord.VoiceClient always has .loop)
+            asyncio.run_coroutine_threadsafe(session.start(), loop)
+        else:  # pragma: no cover — defensive
             logger.warning(
-                "hermes-s2s: voice_client.loop is None — cannot start bridge"
+                "hermes-s2s: voice_client.loop is None — cannot start session"
             )
     except Exception as exc:  # pragma: no cover — defensive
-        logger.warning("hermes-s2s: scheduling bridge.start() failed: %s", exc)
+        logger.warning("hermes-s2s: scheduling session.start() failed: %s", exc)
 
-    # (h) Track on adapter for cleanup
+    # (g) Track bridge on adapter for legacy leave-voice-channel cleanup.
+    # This dict is still consumed by _wrap_leave_voice_channel below.
     bridges = getattr(adapter, "_s2s_bridges", None)
     if bridges is None:
         bridges = {}
@@ -423,12 +591,10 @@ def _attach_realtime_to_voice_client(
             adapter._s2s_bridges = bridges
         except Exception:  # pragma: no cover — defensive
             pass
-    guild = getattr(voice_client, "guild", None)
-    guild_id = getattr(guild, "id", None)
     if guild_id is not None:
         bridges[guild_id] = bridge
 
-    # (i) Silence Hermes core's cascaded voice loop while realtime is active.
+    # (h) Silence Hermes core's cascaded voice loop while realtime is active.
     # Hermes core wires:
     #   adapter._voice_input_callback = self._handle_voice_channel_input
     # which fires faster-whisper STT every time the VoiceReceiver flushes a
@@ -482,7 +648,7 @@ def _attach_realtime_to_voice_client(
     logger.info(
         "hermes-s2s: realtime audio bridge attached (guild=%s, backend=%s)",
         guild_id,
-        getattr(cfg, "realtime_provider", None),
+        realtime_provider,
     )
 
 

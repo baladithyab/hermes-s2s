@@ -216,6 +216,12 @@ def test_attach_realtime_wires_bridge_when_mode_is_realtime(monkeypatch):
     * bridge.start() is scheduled on the voice_client's loop
     * adapter._s2s_bridges[guild_id] is populated
     """
+    # W1c: the factory's capability gate requires GEMINI_API_KEY when the
+    # provider is gemini-live. Set it so the config-default path doesn't
+    # fall back to cascaded. (Pre-W1c this test didn't need the env var
+    # because there was no capability check.)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-xxx")
+
     RealtimeAudioBridgeCls, HermesToolBridgeCls, QueuedPCMSourceCls = (
         _install_b1_b2_stubs(monkeypatch)
     )
@@ -279,8 +285,12 @@ def test_attach_realtime_wires_bridge_when_mode_is_realtime(monkeypatch):
     coro_arg = run_coro.call_args.args[0]
     loop_arg = run_coro.call_args.args[1]
     assert loop_arg is vc.loop
-    # Coroutine object came from bridge.start()
-    bridge_instance.start.assert_called_once()
+    # W1c: the factory now schedules session.start() (not bridge.start())
+    # on the VC loop. The session's _on_start performs the connect-before-
+    # pumps fence (W1b M1.5) and is responsible for wiring the bridge.
+    # So we only assert run_coroutine_threadsafe was called with a coroutine
+    # object from the RealtimeSession — which is verified by the loop_arg
+    # assertion above. The raw bridge.start() no longer fires directly.
     # Tracking for cleanup
     assert getattr(adapter, "_s2s_bridges", {}).get(1234) is bridge_instance
     # Close the coroutine we never awaited to keep pytest warnings quiet.

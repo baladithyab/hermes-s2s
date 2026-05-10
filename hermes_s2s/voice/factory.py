@@ -252,6 +252,11 @@ class VoiceSessionFactory:
         since 0.3.8) keep working. We call that helper here — routing
         through the factory does NOT regress the v0.3.9 fix.
         Tests: ``tests/test_config_unwrap.py``.
+
+        Also eagerly constructs :class:`RealtimeAudioBridge` so the
+        M1.9 ``_attach_realtime_to_voice_client`` glue can pull
+        ``session._bridge`` out for frame-callback / PCM-source wiring
+        BEFORE ``session.start()`` is scheduled on the VC loop.
         """
         options = dict(spec.options or {})
 
@@ -264,6 +269,7 @@ class VoiceSessionFactory:
         pre_resolved_voice: Optional[str] = options.pop(
             "_voice_override", None
         )
+        pre_built_bridge = options.pop("_bridge", None)
 
         system_prompt = pre_resolved_system_prompt
         voice = pre_resolved_voice
@@ -338,6 +344,32 @@ class VoiceSessionFactory:
 
         tools = list(options.get("tools") or [])
 
+        # Eagerly construct RealtimeAudioBridge if the backend is
+        # available. The M1.9 attach glue reads ``session._bridge`` to
+        # wire the frame callback + QueuedPCMSource BEFORE start() is
+        # scheduled on the VC loop. If the bridge module isn't
+        # importable (test env), fall through — the session will build
+        # one lazily in _on_start().
+        bridge = pre_built_bridge
+        if bridge is None and backend is not None:
+            try:
+                from hermes_s2s._internal.audio_bridge import RealtimeAudioBridge
+
+                bridge = RealtimeAudioBridge(
+                    backend=backend,
+                    tool_bridge=self._tool_bridge,
+                    system_prompt=system_prompt,
+                    voice=voice,
+                    tools=list(tools),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "hermes-s2s factory: eager RealtimeAudioBridge construction "
+                    "failed (%s); session will build lazily",
+                    exc,
+                )
+                bridge = None
+
         # Re-stamp options with the resolved values so the session has
         # a useful view for observability. Preserve the _explicit flag
         # so downstream code that reads the session's ``_spec`` sees
@@ -360,6 +392,7 @@ class VoiceSessionFactory:
             system_prompt=system_prompt,
             voice=voice,
             tools=tools,
+            bridge=bridge,
         )
 
 
