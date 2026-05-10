@@ -29,6 +29,135 @@ logger = logging.getLogger(__name__)
 DispatchFn = Callable[[str, dict], Any]  # may be sync or async
 
 
+# ---------------------------------------------------------------------------
+# 3-bucket tool-export policy (WAVE 4b M4.4; ADR-0014 §3).
+#
+# Per Phase-8 security review P0-F1: collapsing to 2 buckets silently promotes
+# ``ask``-bucket tools (file reads, session_search, memory, browser_navigate,
+# HA reads) into ``default_exposed``, creating a voice → filesystem-read path.
+# Fail-closed: unknown tools are hard-dropped from the manifest. The CI fence
+# ``tests/test_tool_export.py::test_every_core_tool_classified`` asserts that
+# every known core tool appears in exactly one of the three buckets.
+# ---------------------------------------------------------------------------
+
+#: Auto-allow, no prompt. Tools with no user-data, no system mutation,
+#: no cost amplification.
+DEFAULT_EXPOSED: set[str] = {
+    "web_search",
+    "vision_analyze",
+    "text_to_speech",
+    "clarify",
+}
+
+#: Synchronous voice yes/no prompt; 5s window; default-deny on timeout.
+#: User-data reads or external-call cost. The meta_dispatcher (W4a) owns the
+#: pending-confirm flow.
+ASK: set[str] = {
+    "read_file",
+    "search_files",
+    "session_search",
+    "memory",
+    "browser_navigate",
+    "ha_state_read",
+    "kanban_show",
+    "kanban_list",
+    "spotify_search",
+    "feishu_doc_read",
+    "xurl_read",
+    "obsidian_read",
+    "youtube_transcript",
+    "arxiv_search",
+    "gif_search",
+}
+
+#: Hard-blocked; tool is removed from the manifest entirely. The LLM cannot
+#: invoke these via voice, and the user cannot override per the persona
+#: overlay (section 4).
+DENY: set[str] = {
+    "terminal",
+    "process",
+    "execute_code",
+    "patch",
+    "write_file",
+    "computer_use",
+    "delegate_task",
+    "cronjob",
+    "ha_call_service",
+    "kanban_create",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_link",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_console",
+    "browser_get_images",
+    "send_message",
+    "skill_manage",
+    "image_generate",
+    "comfyui",
+    "spotify_play",
+    "spotify_pause",
+    "xurl_post",
+    "xurl_dm",
+}
+
+
+def build_tool_manifest(
+    enabled_tools: list[dict], mode: str = "realtime"
+) -> list[dict]:
+    """Filter a Hermes tool list by the 3-bucket voice-export policy.
+
+    Returns a new list containing only tools in ``DEFAULT_EXPOSED`` or
+    ``ASK``, plus the always-exposed ``hermes_meta_*`` tools appended at
+    the end. Tools in ``DENY`` are hard-removed. Unknown/unclassified
+    tools are conservatively dropped (fail-closed).
+
+    Args:
+        enabled_tools: The Hermes-side list of tool schemas. Each entry
+            must have a ``name`` key.
+        mode: Reserved for future per-mode policy variants
+            (``realtime``/``cascaded``). Currently unused; the same
+            3-bucket policy applies to all voice modes.
+
+    Returns:
+        A new list of tool schemas, safe to serialize into a realtime
+        backend's tool manifest.
+    """
+    # Local import to avoid a circular dependency: voice.meta_tools is a
+    # leaf module but lives in a sibling package; importing it eagerly at
+    # module load would tighten the import graph unnecessarily.
+    from hermes_s2s.voice.meta_tools import get_meta_tools
+
+    out: list[dict] = []
+    for tool in enabled_tools:
+        name = tool.get("name", "")
+        if not name:
+            continue
+        if name in DENY:
+            # Hard-drop. The LLM should not even see the tool exists.
+            continue
+        if name in DEFAULT_EXPOSED or name in ASK:
+            out.append(tool)
+            continue
+        # Unknown tool → conservative deny (fail-closed). The CI fence
+        # in tests/test_tool_export.py ensures every known core tool
+        # is classified so this path only fires for genuinely new tools
+        # that Hermes core added without updating the bucket tables.
+        logger.warning(
+            "build_tool_manifest: dropping unclassified tool %r "
+            "(add to DEFAULT_EXPOSED, ASK, or DENY in tool_bridge.py)",
+            name,
+        )
+
+    # Meta tools are always exposed, regardless of the enabled_tools input.
+    out.extend(get_meta_tools())
+    return out
+
+
 class HermesToolBridge:
     """Bridges realtime-backend tool_call events to Hermes's dispatcher.
 
