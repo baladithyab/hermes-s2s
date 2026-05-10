@@ -5,6 +5,43 @@ speech-to-speech backend (Gemini Live or OpenAI Realtime). This is the
 "audio actually flows" release — earlier 0.3.0 shipped the wire protocol
 but left the Discord bridge as a warning log.
 
+## What 0.4.0 adds on top
+
+- **`/s2s` slash command** (plugin-owned). In a Discord channel, type
+  `/s2s` for a picker + status view, `/s2s mode realtime` to switch
+  modes for this session, and `/s2s test "hello"` to smoke-test TTS
+  from chat. Installed automatically when
+  `HERMES_S2S_MONKEYPATCH_DISCORD=1` is set. Session-scoped — does
+  NOT rewrite `config.yaml`; edit YAML to persist across restarts.
+- **Thread mirroring.** Invoked from a thread → reuses it. Invoked
+  from a plain channel → auto-creates a public thread (auto-archive
+  1 day) and mirrors STT transcripts + assistant replies into it.
+  Forum parents fall back to the parent channel. Templates live at
+  `s2s.voice.thread_name_template` /
+  `s2s.voice.thread_starter_message`. The authoritative hook site
+  is `AIAgentRunner._handle_voice_channel_join` — the plugin
+  monkey-patches it so `event.source.thread_id` is set *before*
+  Hermes snapshots the source for subsequent voice MessageEvents.
+- **Voice meta-commands.** Say `hermes <verb>` in-VC to run one of
+  six verbs hands-free: `new`, `compress`, `title`, `branch`, `stop`,
+  `clear`. Detected by the `MetaCommandSink` wakeword grammar and
+  dispatched through the gateway's `MetaDispatcher` *before* the LLM
+  sees the transcript. Wakeword configurable at `s2s.voice.wakeword`.
+  (`resume` is deferred to 0.4.1.)
+- **Voice persona overlay + prompt-injection defense.** Voice replies
+  get a short persona overlay and a hard-coded defense block that
+  refuses "ignore previous instructions" / "you are now …" payloads
+  appearing inside a spoken transcript. Defense-in-depth — the usual
+  `DISCORD_ALLOWED_USERS` allow-list still gates who can talk to the
+  bot. See ADR-0013.
+- **Four modes, one switch.** `s2s.mode ∈ {cascaded, pipeline,
+  realtime, s2s-server}` — the legacy `duplex` boolean is gone.
+  Auto-translates to `realtime` on first load; run
+  `python -m hermes_s2s.migrate_0_4` for a clean one-shot rewrite.
+
+See ADRs 0010–0014 and `docs/design-history/research/13-*`,
+`14-*`, `15-*` for the design rationale behind each of the above.
+
 ## What 0.3.1 actually does
 
 - **Audio bridge moves frames end-to-end.** Incoming Discord 48 kHz stereo
