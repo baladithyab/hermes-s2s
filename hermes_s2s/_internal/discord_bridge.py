@@ -235,6 +235,20 @@ def install_discord_voice_bridge(ctx: Any) -> None:
             _install_via_monkey_patch(ctx)
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("hermes-s2s: Discord voice bridge install failed: %s", exc)
+
+        # W2a M2.1: install the plugin-owned /s2s slash command. Failure
+        # here is non-fatal — the voice bridge itself works without it,
+        # users just lose the mode-picker UX.
+        try:
+            from hermes_s2s.voice.slash import install_s2s_command
+
+            install_s2s_command(ctx)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: /s2s slash command install failed (voice bridge "
+                "still active, just no mode picker): %s",
+                exc,
+            )
         return
 
     # Strategy default — no-op
