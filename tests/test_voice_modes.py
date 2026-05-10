@@ -1,19 +1,31 @@
-"""WAVE 1a tests: VoiceMode + ModeRouter precedence (M1.1).
+"""WAVE 1a tests: VoiceMode + ModeRouter precedence + base session lifecycle.
 
 Per plan docs/plans/wave-0.4.0-rearchitecture.md:
 - This file is SHARED between W1a (this commit) and W1b (concrete
   session tests land later).
 - W1a M1.1 owns: mode-router precedence, typo rejection, alias
   normalization.
-- W1a M1.2 (next commit) adds base-session lifecycle tests.
+- W1a M1.2 owns: VoiceSession protocol + AsyncExitStackBaseSession
+  lifecycle (stop idempotency + state machine + half-start cleanup).
 - W1b owns: the four per-session tests (do not add them here).
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import pytest
 
-from hermes_s2s.voice import ModeRouter, ModeSpec, VoiceMode
+from hermes_s2s.voice import (
+    AsyncExitStackBaseSession,
+    InvalidTransition,
+    ModeRouter,
+    ModeSpec,
+    SessionState,
+    VoiceMode,
+    VoiceSession,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -175,3 +187,150 @@ def test_mode_router_returns_mode_spec():
     # ModeSpec is frozen — attempting mutation raises.
     with pytest.raises(Exception):
         spec.mode = VoiceMode.CASCADED  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# VoiceSession base class — lifecycle + state machine (M1.2)
+# ---------------------------------------------------------------------------
+
+
+class _FakeResource:
+    """Async context manager recording enter/exit for base-session tests."""
+
+    def __init__(self, log: list[str], name: str) -> None:
+        self._log = log
+        self._name = name
+
+    async def __aenter__(self):
+        self._log.append(f"enter:{self._name}")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._log.append(f"exit:{self._name}")
+        return None
+
+
+class _DummySession(AsyncExitStackBaseSession):
+    """Minimal subclass for testing the base-class lifecycle."""
+
+    mode = VoiceMode.CASCADED
+
+    def __init__(self, *, log: list[str] | None = None, fail_on_start: bool = False):
+        super().__init__()
+        self._log = log if log is not None else []
+        self._fail_on_start = fail_on_start
+        self.on_start_called = 0
+        self.on_stop_called = 0
+
+    async def _on_start(self) -> None:
+        self.on_start_called += 1
+        # Register a resource so we can observe LIFO cleanup.
+        await self._exit_stack.enter_async_context(_FakeResource(self._log, "r1"))
+        if self._fail_on_start:
+            raise RuntimeError("boom")
+        await self._exit_stack.enter_async_context(_FakeResource(self._log, "r2"))
+
+    async def _on_stop(self) -> None:
+        self.on_stop_called += 1
+        self._log.append("on_stop")
+
+
+def test_session_satisfies_protocol():
+    """The concrete base + a trivial subclass implement the VoiceSession Protocol."""
+    s = _DummySession()
+    assert isinstance(s, VoiceSession)
+    assert s.mode is VoiceMode.CASCADED
+    assert s.meta_command_sink is None  # None in 0.4.0 per ADR-0013
+
+
+def test_session_stop_idempotent():
+    """Calling stop() twice is fine; state ends at STOPPED."""
+
+    async def _run():
+        s = _DummySession()
+        await s.start()
+        assert s.state is SessionState.RUNNING
+        await s.stop()
+        assert s.state is SessionState.STOPPED
+        # Second stop() must not raise and must not re-trigger teardown.
+        await s.stop()
+        assert s.state is SessionState.STOPPED
+        # Third for good measure.
+        await s.stop()
+        assert s.state is SessionState.STOPPED
+        # _on_stop only fires on the transition FROM RUNNING.
+        assert s.on_stop_called == 1
+
+    asyncio.run(_run())
+
+
+def test_session_state_machine():
+    """
+    - start() drives CREATED -> STARTING -> RUNNING.
+    - stop() on CREATED is a no-op (lands at STOPPED).
+    - start() from STOPPED raises InvalidTransition.
+    - Exit-stack resources unwind in LIFO order.
+    """
+
+    async def _run():
+        # Fresh session is CREATED.
+        s = _DummySession()
+        assert s.state is SessionState.CREATED
+        await s.start()
+        assert s.state is SessionState.RUNNING
+        # Resources were entered in order r1, r2.
+        assert s._log[:2] == ["enter:r1", "enter:r2"]
+
+        await s.stop()
+        assert s.state is SessionState.STOPPED
+        # _on_stop ran BEFORE exit-stack cleanup (pre-teardown hook).
+        # And exit-stack unwinds LIFO -> r2 exits before r1.
+        stop_idx = s._log.index("on_stop")
+        r2_exit_idx = s._log.index("exit:r2")
+        r1_exit_idx = s._log.index("exit:r1")
+        assert stop_idx < r2_exit_idx < r1_exit_idx
+
+        # Re-starting a stopped session is forbidden.
+        with pytest.raises(InvalidTransition):
+            await s.start()
+
+        # stop() on a brand-new (CREATED) session is a no-op that
+        # simply lands at STOPPED without calling _on_stop.
+        s2 = _DummySession()
+        assert s2.state is SessionState.CREATED
+        await s2.stop()
+        assert s2.state is SessionState.STOPPED
+        assert s2.on_stop_called == 0
+
+        # And a stopped-from-CREATED session also can't be started.
+        with pytest.raises(InvalidTransition):
+            await s2.start()
+
+    asyncio.run(_run())
+
+
+def test_session_failed_start_cleans_up():
+    """If _on_start raises, partial resources are released and state is STOPPED."""
+
+    async def _run():
+        log: list[str] = []
+        s = _DummySession(log=log, fail_on_start=True)
+        with pytest.raises(RuntimeError, match="boom"):
+            await s.start()
+        assert s.state is SessionState.STOPPED
+        # r1 was entered before the failure; it must have been released.
+        assert "enter:r1" in log
+        assert "exit:r1" in log
+        # r2 was never entered (the failure came between r1 and r2).
+        assert "enter:r2" not in log
+        # stop() after a failed start is still a safe no-op.
+        await s.stop()
+        assert s.state is SessionState.STOPPED
+
+    asyncio.run(_run())
+
+
+def test_session_exit_stack_is_shared_resource():
+    """Subclasses access the same AsyncExitStack used by stop()."""
+    s = _DummySession()
+    assert isinstance(s._exit_stack, contextlib.AsyncExitStack)
