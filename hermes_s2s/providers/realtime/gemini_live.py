@@ -151,6 +151,44 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
     def _build_setup(
         self, system_prompt: str, tools: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        # Defense-in-depth language anchor — Gemini Live native-audio models
+        # auto-detect output language from input audio cues, which can pin
+        # an entire session to a non-English language when the first user
+        # turn is quiet/accented. Prepending an explicit directive to the
+        # system prompt keeps the model in the configured language even if
+        # the caller passes a weak/minimal system_prompt. See
+        # docs/research/10-arabic-language-rootcause.md (Fix C).
+        lang_code = (self.language_code or "en-US").split("-")[0].lower()
+        _LANG_NAMES = {
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "nl": "Dutch",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "zh": "Chinese",
+            "ar": "Arabic",
+            "hi": "Hindi",
+            "ru": "Russian",
+            "pl": "Polish",
+            "tr": "Turkish",
+            "sv": "Swedish",
+            "da": "Danish",
+            "no": "Norwegian",
+            "fi": "Finnish",
+            "cs": "Czech",
+            "el": "Greek",
+            "he": "Hebrew",
+            "id": "Indonesian",
+            "th": "Thai",
+            "vi": "Vietnamese",
+            "uk": "Ukrainian",
+        }
+        lang_name = _LANG_NAMES.get(lang_code, lang_code.upper())
+        anchored = f"Respond exclusively in {lang_name}.\n\n{system_prompt}"
         setup: Dict[str, Any] = {
             "model": f"models/{self.model}" if "/" not in self.model else self.model,
             "generationConfig": {
@@ -160,7 +198,7 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
                     "languageCode": self.language_code,
                 },
             },
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "systemInstruction": {"parts": [{"text": anchored}]},
             "realtimeInputConfig": {
                 "automaticActivityDetection": {"disabled": False},
                 "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
@@ -422,11 +460,17 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
 
 
 def make_gemini_live(config: Dict[str, Any]) -> GeminiLiveBackend:
-    cfg = config or {}
+    cfg = dict(config or {})
+    # Unwrap the provider sub-block if present (wizard-written configs nest
+    # settings under s2s.realtime.gemini_live.*). Sub-block wins over outer
+    # keys, which remain supported for flat back-compat configs. See
+    # docs/research/10-arabic-language-rootcause.md (Fix B).
+    sub = cfg.get("gemini_live") if isinstance(cfg.get("gemini_live"), dict) else {}
+    merged = {**cfg, **sub}
     return GeminiLiveBackend(
-        api_key_env=cfg.get("api_key_env", "GEMINI_API_KEY"),
-        model=cfg.get("model", "gemini-2.5-flash-native-audio-latest"),
-        voice=cfg.get("voice", "Aoede"),
-        language_code=cfg.get("language_code", "en-US"),
-        url=cfg.get("url"),  # primarily for tests
+        api_key_env=merged.get("api_key_env", "GEMINI_API_KEY"),
+        model=merged.get("model", "gemini-2.5-flash-native-audio-latest"),
+        voice=merged.get("voice", "Aoede"),
+        language_code=merged.get("language_code", "en-US"),
+        url=merged.get("url"),  # primarily for tests
     )

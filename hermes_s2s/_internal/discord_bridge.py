@@ -76,6 +76,47 @@ _S2S_LEAVE_WRAPPED_MARKER = "__hermes_s2s_leave_wrapped__"
 # Marker on a VoiceReceiver instance so we only install our frame shim once.
 _FRAME_CB_INSTALLED_MARKER = "__hermes_s2s_frame_cb_installed__"
 
+# English-anchored default voice-assistant prompt. Mirrors cli.py's wizard
+# default. Gemini Live native-audio models auto-detect language from input
+# audio, so an explicit English anchor is the most reliable way to keep the
+# assistant from slipping into another language when the first turn is quiet
+# or accented (see docs/research/10-arabic-language-rootcause.md).
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful voice assistant.\n"
+    "Always respond in English unless the user explicitly asks you to "
+    "switch languages.\n"
+    "Respond briefly and naturally — one to three sentences for casual "
+    "conversation."
+)
+
+
+def _resolve_bridge_params(cfg: Any) -> Tuple[str, Any]:
+    """Resolve ``(system_prompt, voice)`` for RealtimeAudioBridge from an S2SConfig.
+
+    Mirrors ``doctor.py:_active_provider_block`` — looks up the
+    provider-specific sub-block under ``realtime_options`` (e.g.
+    ``realtime_options['gemini_live']``) and pulls ``system_prompt`` / ``voice``
+    from there, with fallback to the outer ``realtime_options`` for
+    back-compat with flat configs, and finally to the module default.
+    """
+    realtime_opts = getattr(cfg, "realtime_options", {}) or {}
+    provider = (getattr(cfg, "realtime_provider", "") or "").lower()
+    if "gemini" in provider:
+        key = "gemini_live"
+    elif "openai" in provider or "gpt-realtime" in provider:
+        key = "openai"
+    else:
+        key = provider.replace("-", "_")
+    provider_block = realtime_opts.get(key, {}) if isinstance(realtime_opts, dict) else {}
+    if not isinstance(provider_block, dict):
+        provider_block = {}
+    system_prompt = provider_block.get(
+        "system_prompt",
+        realtime_opts.get("system_prompt", _DEFAULT_SYSTEM_PROMPT),
+    )
+    voice = provider_block.get("voice", realtime_opts.get("voice"))
+    return system_prompt, voice
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -331,17 +372,17 @@ def _attach_realtime_to_voice_client(
             tool_bridge = None
 
     # (d) Audio bridge
-    # Pull system_prompt + voice from cfg.realtime_options so users can
-    # customize without re-rolling their own backend. Tools stay empty for
-    # 0.3.1 — real tool list wiring to Hermes's registry is 0.3.2.
-    realtime_opts = getattr(cfg, "realtime_options", {}) or {}
+    # Pull system_prompt + voice via _resolve_bridge_params, which unwraps the
+    # provider sub-block (realtime_options['gemini_live'] / 'openai') where
+    # the wizard writes the anchored defaults. Outer-level read kept as a
+    # back-compat fallback for pre-0.3.8 flat configs. See
+    # docs/research/10-arabic-language-rootcause.md (Fix A).
+    system_prompt, voice = _resolve_bridge_params(cfg)
     bridge = RealtimeAudioBridge(
         backend=backend,
         tool_bridge=tool_bridge,
-        system_prompt=realtime_opts.get(
-            "system_prompt", "You are a helpful voice assistant. Respond briefly."
-        ),
-        voice=realtime_opts.get("voice", None),
+        system_prompt=system_prompt,
+        voice=voice,
         tools=[],
     )
 

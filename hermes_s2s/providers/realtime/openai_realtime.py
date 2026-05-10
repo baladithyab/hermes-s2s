@@ -356,11 +356,17 @@ class OpenAIRealtimeBackend:
 
 
 def make_openai_realtime(config: Dict[str, Any]) -> OpenAIRealtimeBackend:
-    cfg = config or {}
+    cfg = dict(config or {})
+    # Unwrap the provider sub-block if present (wizard-written configs nest
+    # settings under s2s.realtime.openai.*). Sub-block wins over outer keys,
+    # which remain supported for flat back-compat configs. See
+    # docs/research/10-arabic-language-rootcause.md (Fix B).
+    sub = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+    merged = {**cfg, **sub}
     return OpenAIRealtimeBackend(
-        api_key_env=cfg.get("api_key_env", "OPENAI_API_KEY"),
-        model=cfg.get("model", _DEFAULT_MODEL),
-        voice=cfg.get("voice", _DEFAULT_VOICE),
-        connect_url=cfg.get("connect_url"),
-        api_key=cfg.get("api_key"),
+        api_key_env=merged.get("api_key_env", "OPENAI_API_KEY"),
+        model=merged.get("model", _DEFAULT_MODEL),
+        voice=merged.get("voice", _DEFAULT_VOICE),
+        connect_url=merged.get("connect_url"),
+        api_key=merged.get("api_key"),
     )
