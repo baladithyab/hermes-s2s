@@ -30,20 +30,25 @@ python -m hermes_s2s.migrate_0_4 --rollback # restore from .bak
 ### The `/s2s` slash command (Discord, 0.4.0+)
 
 0.4.0 ships a plugin-owned `/s2s` slash command that Hermes registers
-when `HERMES_S2S_MONKEYPATCH_DISCORD=1` is set. It's the fastest way
-to switch modes in a live Discord session without touching YAML:
+when `HERMES_S2S_MONKEYPATCH_DISCORD=1` is set. In 0.4.0 the surface
+is deliberately small — exactly one subcommand with one required
+argument:
 
 ```
-/s2s                         # show current mode + backend readiness
-/s2s mode realtime           # switch mode for this session only
-/s2s mode cascaded           # ...and back
-/s2s test                    # TTS smoke test — bot speaks a short phrase
-/s2s test "hello there"      # ...with specific text
+/s2s mode:<choice>   # where <choice> ∈ {cascaded, pipeline, realtime, s2s-server}
 ```
 
-`/s2s mode <name>` is session-scoped — it does NOT write to
-`config.yaml`. Edit YAML (or re-run `hermes s2s setup`) to make the
-choice persistent across restarts.
+The `mode:` option is a Discord slash-command choice list, so the
+client shows a picker — no typos possible. The switch is
+**session-scoped**: it updates the in-memory session config for this
+guild+channel only and does NOT write to `config.yaml`. Edit YAML
+(or re-run `hermes s2s setup`) to make the choice persistent across
+restarts.
+
+Status / readiness views and the TTS smoke-test command are **not**
+part of the 0.4.0 `/s2s` surface. Use `hermes s2s doctor` (see §4.5)
+for readiness, and `hermes s2s test --text "..."` from the CLI for a
+TTS smoke test.
 
 ### Thread mirroring (Discord, 0.4.0+)
 
@@ -68,20 +73,30 @@ for the resolver decision table.
 ### Voice meta-commands (0.4.0+)
 
 With voice mode active, you can control the session hands-free by
-saying the wakeword followed by a verb. Defaults:
+saying the wakeword followed by a verb phrase. Defaults:
 
-- **Wakeword:** `hermes` (configurable at `s2s.voice.wakeword`)
-- **Verbs:** `new`, `compress`, `title`, `branch`, `stop`, `clear`
-  (`resume` is planned for 0.4.1)
+- **Wakeword:** `hey aria` (configurable at `s2s.voice.wakeword`)
+- **Verbs:** `new`, `compress`, `title`, `branch`, `clear`,
+  `stop_speaking` (`resume` is planned for 0.4.1)
 
-Examples (spoken aloud into the VC):
+The grammar is phrase-based, not single-word — the `MetaCommandSink`
+in `hermes_s2s/voice/meta.py` is the source of truth. Example
+utterances (spoken aloud into the VC):
 
-- "hermes new" — start a new conversation turn / reset context
-- "hermes compress" — summarize the current session
-- "hermes title" — ask Hermes to title the current thread
-- "hermes branch" — branch this session into a new thread
-- "hermes stop" — cancel the current assistant utterance / tool run
-- "hermes clear" — clear the conversation history
+- "hey aria, start a new session" — new session / reset context
+  (also accepts `begin`/`open`, and optional trailing text like
+  "…about React" is captured as a title hint)
+- "hey aria, compress the context" — summarize the current session
+  (also `condense`/`summarize`)
+- "hey aria, title this session as Voice Bridge Debug" — set the
+  session title (also `name`; 1–80 chars captured)
+- "hey aria, branch off here" — branch this session at the current
+  point (also `fork`, and `from here`/`now`/`this point`)
+- "hey aria, clear the context" — clear conversation history (also
+  `reset`; `clear the session` also works)
+- "hey aria, stop" — interrupt the current TTS / realtime audio
+  output (also `cancel`/`hush`/`quiet`). This does NOT dispatch a
+  slash command; it just cuts the current utterance.
 
 Meta-commands are detected by the `MetaCommandSink` wakeword grammar
 and dispatched through the gateway's `MetaDispatcher` BEFORE the LLM
@@ -107,21 +122,31 @@ See ADR-0013 and `docs/design-history/research/13-persona-overlay.md`
 for the prompt-design rationale and the attack taxonomy the
 defense targets.
 
-### 3-bucket tool-export policy (0.4.0+)
+### 2-bucket tool-export policy (provisional for 0.4.0)
 
-Voice-mode tools now fall into three explicit buckets:
+Voice-mode tools in 0.4.0 fall into **two explicit buckets**, with the
+third "ask" bucket deferred to 0.4.1:
 
-- **Always-on** — `hermes_meta_*` tools exported to every voice
-  session regardless of user toolset config (these back the
-  meta-commands above).
-- **Opt-in** — standard Hermes tools; exported only if they're in
-  the user's configured toolset.
-- **Deny-listed** — tools that are dangerous or nonsensical in a
-  voice context (e.g. interactive TUI tools). Never exported,
-  enforced by a CI fence in `tests/test_tool_export_policy.py`.
+- **Always-on (default-exposed)** — `hermes_meta_*` tools (which back
+  the meta-commands above) plus a small curated allow-list
+  (`web_search`, `vision_analyze`, `text_to_speech`, `clarify`).
+  These are exported to every voice session regardless of the user's
+  configured toolset.
+- **Deny-listed** — everything else the LLM could otherwise call is
+  fail-closed in voice mode (interactive TUI tools, arbitrary file
+  ops, shell, etc.). Enforced by a CI fence in
+  `tests/test_tool_export_policy.py` that imports the canonical
+  core-tools list at test time and asserts the deny-list stays
+  closed as the core surface grows.
 
-ADR-0014 has the bucket definitions; the policy module lives at
-`hermes_s2s.voice.tool_bridge`.
+The third **`ask` bucket** — tools that require a synchronous
+voice-confirm flow ("ARIA wants to read FILENAME — say yes or no")
+before they fire — is designed in ADR-0014 but the confirm-flow
+runtime is deferred to 0.4.1. The 2-bucket posture above is the
+0.4.0 shipping shape. See ADR-0014 "0.4.0 implementation note" for
+the framing.
+
+The policy module lives at `hermes_s2s.voice.tool_bridge`.
 
 ## 1. How Hermes voice mode finds providers
 

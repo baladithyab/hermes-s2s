@@ -7,12 +7,15 @@ but left the Discord bridge as a warning log.
 
 ## What 0.4.0 adds on top
 
-- **`/s2s` slash command** (plugin-owned). In a Discord channel, type
-  `/s2s` for a picker + status view, `/s2s mode realtime` to switch
-  modes for this session, and `/s2s test "hello"` to smoke-test TTS
-  from chat. Installed automatically when
+- **`/s2s` slash command** (plugin-owned). In a Discord channel,
+  run `/s2s mode:<choice>` where `<choice>` is one of
+  `cascaded | pipeline | realtime | s2s-server` — the Discord
+  client shows a picker. Installed automatically when
   `HERMES_S2S_MONKEYPATCH_DISCORD=1` is set. Session-scoped — does
   NOT rewrite `config.yaml`; edit YAML to persist across restarts.
+  Status / readiness and smoke-test commands are not on the 0.4.0
+  `/s2s` surface — use `hermes s2s doctor` and
+  `hermes s2s test --text "..."` from the CLI.
 - **Thread mirroring.** Invoked from a thread → reuses it. Invoked
   from a plain channel → auto-creates a public thread (auto-archive
   1 day) and mirrors STT transcripts + assistant replies into it.
@@ -22,11 +25,15 @@ but left the Discord bridge as a warning log.
   is `AIAgentRunner._handle_voice_channel_join` — the plugin
   monkey-patches it so `event.source.thread_id` is set *before*
   Hermes snapshots the source for subsequent voice MessageEvents.
-- **Voice meta-commands.** Say `hermes <verb>` in-VC to run one of
-  six verbs hands-free: `new`, `compress`, `title`, `branch`, `stop`,
-  `clear`. Detected by the `MetaCommandSink` wakeword grammar and
+- **Voice meta-commands.** Say the wakeword (default `hey aria`)
+  followed by a verb phrase to run one of six verbs hands-free:
+  e.g. `"hey aria, start a new session"`, `"hey aria, compress the
+  context"`, `"hey aria, title this session as X"`, `"hey aria,
+  branch off here"`, `"hey aria, clear the context"`, `"hey aria,
+  stop"`. Detected by the `MetaCommandSink` wakeword grammar and
   dispatched through the gateway's `MetaDispatcher` *before* the LLM
-  sees the transcript. Wakeword configurable at `s2s.voice.wakeword`.
+  sees the transcript. Wakeword configurable at `s2s.voice.wakeword`;
+  the full grammar lives in `hermes_s2s/voice/meta.py`.
   (`resume` is deferred to 0.4.1.)
 - **Voice persona overlay + prompt-injection defense.** Voice replies
   get a short persona overlay and a hard-coded defense block that
