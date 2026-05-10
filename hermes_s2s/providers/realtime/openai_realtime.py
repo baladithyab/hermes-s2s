@@ -342,6 +342,19 @@ class OpenAIRealtimeBackend:
             }
         )
 
+    async def send_activity_start(self) -> None:
+        """No-op: OpenAI Realtime uses ``turn_detection.server_vad`` which works
+        correctly with Discord's bursty packet flow (its VAD doesn't time-out on
+        stream pauses the way Gemini's does). Provided so the audio bridge can
+        call uniformly across backends. See
+        ``hermes_s2s.providers.realtime.RealtimeBackend.send_activity_start``.
+        """
+        return None
+
+    async def send_activity_end(self) -> None:
+        """No-op counterpart to ``send_activity_start``. See that docstring."""
+        return None
+
     async def close(self) -> None:
         self._client_initiated_close = True
         if self._ws is None or self._closed:

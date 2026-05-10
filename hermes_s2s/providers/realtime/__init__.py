@@ -38,6 +38,8 @@ class RealtimeBackend(Protocol):
 
     async def connect(self, system_prompt: str, voice: str, tools: list[dict]) -> None: ...
     async def send_audio_chunk(self, pcm_chunk: bytes, sample_rate: int) -> None: ...
+    async def send_activity_start(self) -> None: ...
+    async def send_activity_end(self) -> None: ...
     async def recv_events(self) -> AsyncIterator[RealtimeEvent]: ...
     async def inject_tool_result(self, call_id: str, result: str) -> None: ...
     async def send_filler_audio(self, text: str) -> None: ...
@@ -67,6 +69,16 @@ class _BaseRealtimeBackend:
 
     async def send_audio_chunk(self, *a: Any, **kw: Any) -> None:
         raise NotImplementedError
+
+    async def send_activity_start(self) -> None:
+        # Default no-op: backends with server-side VAD that handles Discord-style
+        # bursty input correctly (e.g. OpenAI Realtime) can leave this unimplemented.
+        # Manual-VAD backends (Gemini Live with AAD disabled) override.
+        return None
+
+    async def send_activity_end(self) -> None:
+        # See send_activity_start docstring.
+        return None
 
     async def recv_events(self) -> AsyncIterator[RealtimeEvent]:  # pragma: no cover - stub
         if False:  # noqa: SIM108 - keep async generator typing

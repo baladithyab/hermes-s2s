@@ -344,6 +344,17 @@ class RealtimeAudioBridge:
         self._closed = False
         self._stop_event: Optional[asyncio.Event] = None
         self._tool_tasks: set[asyncio.Task[Any]] = set()
+        # 0.4.2 Manual VAD state — for backends that disable server-side VAD
+        # (Gemini Live with automaticActivityDetection.disabled=True). For
+        # backends with their own VAD (OpenAI Realtime), the activity_start/
+        # activity_end calls are no-ops, but we still maintain this state so
+        # tests and stats are uniform across backends.
+        # See docs/plans/wave-0.4.2-manual-vad.md.
+        self._activity_open: bool = False
+        self._activity_starts_sent: int = 0
+        self._activity_ends_sent: int = 0
+        self._last_input_frame_monotonic: float = 0.0
+        self._silence_gap_s: float = 0.8  # commit utterance after this much quiet
         # Tool-call ordering primitives (created lazily on first tool_call
         # so they bind to the running loop, not the constructor's loop).
         self._tool_seq_lock: Optional[asyncio.Lock] = None
@@ -390,6 +401,21 @@ class RealtimeAudioBridge:
         self._closed = True
         if self._stop_event is not None:
             self._stop_event.set()
+        # 0.4.2: if we're shutting down with an open activity, emit a final
+        # activity_end so Gemini flushes the in-flight utterance instead of
+        # holding it server-side. Best-effort; backend may already be torn
+        # down. The default Protocol method is a no-op for non-manual-VAD
+        # backends.
+        if self._activity_open:
+            try:
+                await self.backend.send_activity_end()
+                self._activity_open = False
+                self._activity_ends_sent += 1
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "stop(): final send_activity_end failed (backend may be gone)",
+                    exc_info=True,
+                )
         # Cancel the supervisor task (which will in turn cancel its children).
         if self._task is not None and not self._task.done():
             self._task.cancel()
@@ -444,11 +470,23 @@ class RealtimeAudioBridge:
         Delegates to ``self.buffer.stats()`` and augments with bridge-level
         counters (G3 / BACKLOG-0.3.2 F5).
         """
+        import time as _time
+
         s = dict(self.buffer.stats())
         s["backend_input_rate"] = self._backend_input_rate
         s["backend_output_rate"] = self._backend_output_rate
         s["closed"] = self._closed
         s["tool_tasks_in_flight"] = len(self._tool_tasks)
+        # 0.4.2 manual-VAD diagnostics.
+        s["activity_open"] = self._activity_open
+        s["activity_starts_sent"] = self._activity_starts_sent
+        s["activity_ends_sent"] = self._activity_ends_sent
+        if self._last_input_frame_monotonic > 0:
+            s["time_since_last_frame_s"] = round(
+                _time.monotonic() - self._last_input_frame_monotonic, 3
+            )
+        else:
+            s["time_since_last_frame_s"] = None
         return s
 
     # ---------------- bridge loop ----------------
@@ -460,9 +498,18 @@ class RealtimeAudioBridge:
         # G3+: periodic stats heartbeat (every 10s) so live debugging doesn't
         # need DEBUG-level logs. Cheap and silent if nothing is happening.
         stats_task = asyncio.create_task(self._stats_heartbeat(), name="bridge.stats_heartbeat")
-        self._children = [in_task, out_task, stats_task]
+        # 0.4.2 silence watchdog — drives activity_end after _silence_gap_s of
+        # no input frames. Necessary for backends with server-side VAD disabled
+        # (Gemini Live in manual-VAD mode); harmless otherwise (the backend's
+        # send_activity_end is a no-op).
+        watchdog_task = asyncio.create_task(
+            self._silence_watchdog(), name="bridge.silence_watchdog"
+        )
+        self._children = [in_task, out_task, stats_task, watchdog_task]
         try:
-            await asyncio.gather(in_task, out_task, stats_task, return_exceptions=True)
+            await asyncio.gather(
+                in_task, out_task, stats_task, watchdog_task, return_exceptions=True
+            )
         except asyncio.CancelledError:
             for t in self._children:
                 if not t.done():
@@ -477,6 +524,58 @@ class RealtimeAudioBridge:
                         await t
                     except (asyncio.CancelledError, Exception):  # noqa: BLE001
                         pass
+
+    async def _silence_watchdog(self) -> None:
+        """Drive activity_end after a configurable gap of no input frames.
+
+        Polls every 100ms. When activity is open and the last input frame was
+        more than ``self._silence_gap_s`` ago, emits ``backend.send_activity_end``
+        and clears the open flag. The next input frame will reopen with
+        ``send_activity_start``.
+
+        For backends with a working server-side VAD (OpenAI Realtime), the
+        ``send_activity_*`` calls are no-ops so the watchdog still runs
+        harmlessly. For Gemini Live in manual-VAD mode (``automaticActivity\
+        Detection.disabled=True``) this is required to commit each utterance —
+        the server otherwise waits indefinitely.
+        """
+        import time as _time
+
+        try:
+            while True:
+                await asyncio.sleep(0.1)
+                if not self._activity_open:
+                    continue
+                if self._last_input_frame_monotonic <= 0:
+                    continue
+                gap = _time.monotonic() - self._last_input_frame_monotonic
+                if gap < self._silence_gap_s:
+                    continue
+                # Quiet long enough — close the activity window.
+                try:
+                    await self.backend.send_activity_end()
+                    self._activity_open = False
+                    self._activity_ends_sent += 1
+                    logger.info(
+                        "hermes-s2s: silence watchdog closed activity "
+                        "(gap=%.2fs after %d frames; starts=%d ends=%d)",
+                        gap,
+                        # buffer counts dropped frames as well, but a useful
+                        # lower bound for "frames in this utterance" is the
+                        # cumulative emitted count delta — we don't track that
+                        # per-utterance so just log the totals.
+                        self.buffer.stats().get("frames_emitted", 0),
+                        self._activity_starts_sent,
+                        self._activity_ends_sent,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("backend.send_activity_end failed")
+                    # Don't clear _activity_open on error — let the next
+                    # successful send do it.
+        except asyncio.CancelledError:
+            raise
 
     async def _stats_heartbeat(self) -> None:
         """Log bridge stats every 10s while running. Cheap, INFO level.
@@ -521,7 +620,17 @@ class RealtimeAudioBridge:
             raise
 
     async def _pump_input(self) -> None:
-        """Drain input queue -> resample to backend rate -> backend.send_audio_chunk."""
+        """Drain input queue -> resample to backend rate -> backend.send_audio_chunk.
+
+        On every successful pop_input we (a) update _last_input_frame_monotonic
+        (drives the silence watchdog that fires activity_end) and (b) emit
+        activity_start if no activity is currently open. Both are wired for
+        the manual-VAD case (Gemini Live with AAD disabled); for backends with
+        a working server-side VAD over Discord input the activity_* calls are
+        no-ops and this is just bookkeeping.
+        """
+        import time as _time
+
         while True:
             try:
                 _user_id, pcm = await self.buffer.pop_input()
@@ -531,6 +640,19 @@ class RealtimeAudioBridge:
                 logger.exception("pop_input failed")
                 await asyncio.sleep(0.005)
                 continue
+
+            # Mark new utterance start if we don't have one open.
+            if not self._activity_open:
+                try:
+                    await self.backend.send_activity_start()
+                    self._activity_open = True
+                    self._activity_starts_sent += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("backend.send_activity_start failed")
+            self._last_input_frame_monotonic = _time.monotonic()
+
             try:
                 # resample_pcm handles equal-rate as a fast path and also
                 # performs the stereo→mono mixdown Discord input always

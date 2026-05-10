@@ -200,7 +200,7 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
             },
             "systemInstruction": {"parts": [{"text": anchored}]},
             "realtimeInputConfig": {
-                "automaticActivityDetection": {"disabled": False},
+                "automaticActivityDetection": {"disabled": True},
                 "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
             },
             "inputAudioTranscription": {},
@@ -441,12 +441,36 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
     async def interrupt(self) -> None:
         """Manual interrupt — send activityStart/activityEnd bracket.
 
-        Only meaningful when `automaticActivityDetection.disabled=true`. With
-        default VAD the server handles barge-in automatically.
+        Useful as a barge-in primitive (server treats it as user-spoke-and-stopped
+        in zero time). With AAD disabled in 0.4.2+ this is a degenerate case of
+        the regular per-utterance bracket emitted by the audio bridge.
+        """
+        if self._ws is None:
+            return
+        await self.send_activity_start()
+        await self.send_activity_end()
+
+    async def send_activity_start(self) -> None:
+        """Emit BidiGenerateContentRealtimeInput.activityStart.
+
+        Required when ``automaticActivityDetection.disabled=true`` (our default
+        from 0.4.2 onward). The audio bridge calls this when the first input
+        frame of an utterance arrives. See
+        https://ai.google.dev/gemini-api/docs/live-guide#disable-vad.
         """
         if self._ws is None:
             return
         await self._ws.send(json.dumps({"realtimeInput": {"activityStart": {}}}))
+
+    async def send_activity_end(self) -> None:
+        """Emit BidiGenerateContentRealtimeInput.activityEnd.
+
+        Required when AAD is disabled — Gemini will not commit a turn until it
+        receives this. The audio bridge's silence watchdog calls this after a
+        configurable gap of no input frames.
+        """
+        if self._ws is None:
+            return
         await self._ws.send(json.dumps({"realtimeInput": {"activityEnd": {}}}))
 
     # ------------------------------------------------------------------ #
