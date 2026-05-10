@@ -48,6 +48,19 @@ _MONKEYPATCH_LINE = "HERMES_S2S_MONKEYPATCH_DISCORD=1"
 
 def _realtime_s2s_block(profile: str) -> dict:
     """Return the full s2s.{mode,realtime} config block for a realtime profile."""
+    # Anchored English system prompt — Gemini Live native-audio models
+    # auto-detect language from input audio, so casual breath/silence on the
+    # first turn can pin the conversation to a non-English language. Stating
+    # the language constraint explicitly in the prompt is the most reliable
+    # way to keep the assistant in English (see issue: live VC reply in
+    # Arabic on v0.3.7 with the older one-line prompt).
+    _DEFAULT_SYSTEM_PROMPT = (
+        "You are a helpful voice assistant.\n"
+        "Always respond in English unless the user explicitly asks you to "
+        "switch languages.\n"
+        "Respond briefly and naturally — one to three sentences for casual "
+        "conversation."
+    )
     if profile == "realtime-gemini":
         return {
             "mode": "realtime",
@@ -56,7 +69,8 @@ def _realtime_s2s_block(profile: str) -> dict:
                 "gemini_live": {
                     "model": "gemini-2.5-flash-native-audio-latest",
                     "voice": "Aoede",
-                    "system_prompt": "You are a helpful voice assistant. Respond briefly.",
+                    "language_code": "en-US",
+                    "system_prompt": _DEFAULT_SYSTEM_PROMPT,
                 },
             },
         }
@@ -68,7 +82,7 @@ def _realtime_s2s_block(profile: str) -> dict:
                 "openai": {
                     "model": "gpt-realtime",
                     "voice": "alloy",
-                    "system_prompt": "You are a helpful voice assistant. Respond briefly.",
+                    "system_prompt": _DEFAULT_SYSTEM_PROMPT,
                 },
             },
         }
@@ -80,7 +94,7 @@ def _realtime_s2s_block(profile: str) -> dict:
                 "openai": {
                     "model": "gpt-realtime-mini",
                     "voice": "alloy",
-                    "system_prompt": "You are a helpful voice assistant. Respond briefly.",
+                    "system_prompt": _DEFAULT_SYSTEM_PROMPT,
                 },
             },
         }
