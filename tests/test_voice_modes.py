@@ -190,6 +190,274 @@ def test_mode_router_returns_mode_spec():
 
 
 # ---------------------------------------------------------------------------
+# WAVE 1b — concrete session class tests
+# ---------------------------------------------------------------------------
+# These tests are owned by W1b and exercise M1.3 (CascadedSession),
+# M1.4 (CustomPipelineSession), M1.5 (RealtimeSession), and M1.6
+# (S2SServerSession). They depend on symbols introduced by W1a
+# (VoiceMode, ModeSpec, AsyncExitStackBaseSession) and therefore
+# sit below the W1a section.
+#
+# The marquee test here is
+# ``test_realtime_session_calls_connect_before_pumps`` which, per the
+# post-Phase-8 acceptance refinement in
+# docs/plans/wave-0.4.0-rearchitecture.md WAVE 1b, uses
+# ``AsyncMock.side_effect`` to record call order. Plain
+# ``assert_called()`` is REJECTED — it passes even with the v0.3.1
+# silent-bot bug shape where pumps spawned before ``connect()``
+# returned.
+
+import os
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+from hermes_s2s.voice.sessions_cascaded import CascadedSession
+from hermes_s2s.voice.sessions_pipeline import (
+    CustomPipelineSession,
+    _STT_ENV,
+    _TTS_ENV,
+)
+from hermes_s2s.voice.sessions_realtime import RealtimeSession
+from hermes_s2s.voice.sessions_s2s_server import S2SServerSession
+
+
+def _spec(mode: VoiceMode, **options: Any) -> ModeSpec:
+    return ModeSpec(mode=mode, provider=None, options=dict(options))
+
+
+# --- M1.3: CascadedSession ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cascaded_session_is_noop():
+    """CascadedSession start/stop succeed without touching env or spawning tasks."""
+    spec = _spec(VoiceMode.CASCADED)
+    before_env = dict(os.environ)
+
+    session = CascadedSession(spec)
+    assert session.mode is VoiceMode.CASCADED
+
+    await session.start()
+    # Env untouched.
+    assert os.environ.get(_STT_ENV) == before_env.get(_STT_ENV)
+    assert os.environ.get(_TTS_ENV) == before_env.get(_TTS_ENV)
+
+    await session.stop()
+    # Stop is idempotent.
+    await session.stop()
+
+
+# --- M1.4: CustomPipelineSession -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pipeline_session_restores_env(monkeypatch):
+    """start() installs env vars; stop() restores prior state (unset stays unset)."""
+    # Prior state: STT had a value, TTS did not.
+    monkeypatch.setenv(_STT_ENV, "PRIOR_STT")
+    monkeypatch.delenv(_TTS_ENV, raising=False)
+
+    spec = _spec(
+        VoiceMode.PIPELINE,
+        stt_command="new-stt --model tiny",
+        tts_command="new-tts --voice af",
+    )
+    session = CustomPipelineSession(spec)
+
+    await session.start()
+    assert os.environ[_STT_ENV] == "new-stt --model tiny"
+    assert os.environ[_TTS_ENV] == "new-tts --voice af"
+
+    await session.stop()
+    # Prior value restored; absent var stays absent.
+    assert os.environ.get(_STT_ENV) == "PRIOR_STT"
+    assert _TTS_ENV not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_pipeline_session_restores_env_when_no_prior_value(monkeypatch):
+    """stop() should *unset* env vars that were unset going in."""
+    monkeypatch.delenv(_STT_ENV, raising=False)
+    monkeypatch.delenv(_TTS_ENV, raising=False)
+
+    spec = _spec(
+        VoiceMode.PIPELINE, stt_command="X", tts_command="Y"
+    )
+    session = CustomPipelineSession(spec)
+    await session.start()
+    assert os.environ[_STT_ENV] == "X"
+    await session.stop()
+    assert _STT_ENV not in os.environ
+    assert _TTS_ENV not in os.environ
+
+
+# --- M1.5: RealtimeSession -----------------------------------------------
+
+
+def _make_realtime_backend(record: list):
+    """Build a mock backend whose async methods append to ``record``."""
+    backend = MagicMock()
+
+    async def _connect(*_a, **_kw):
+        record.append("connect")
+
+    async def _send(*_a, **_kw):
+        record.append("pump_input_started")
+
+    def _recv_events(*_a, **_kw):
+        # recv_events() returns an async iterator; creating it marks
+        # the output pump as started so the fence test can observe it.
+        record.append("pump_output_started")
+
+        async def _gen():
+            # Sleep forever so the pump stays alive until cancelled.
+            await asyncio.sleep(3600)
+            if False:  # pragma: no cover - async generator shape only
+                yield None
+
+        return _gen()
+
+    async def _close(*_a, **_kw):
+        record.append("close")
+
+    backend.connect = AsyncMock(side_effect=_connect)
+    backend.send_audio_chunk = AsyncMock(side_effect=_send)
+    backend.recv_events = MagicMock(side_effect=_recv_events)
+    backend.close = AsyncMock(side_effect=_close)
+    return backend
+
+
+@pytest.mark.asyncio
+async def test_realtime_session_calls_connect_before_pumps():
+    """THE regression-fence test (post-Phase-8 A1 acceptance).
+
+    Uses ``AsyncMock.side_effect`` to record the exact order in which
+    the session touches the backend. The v0.3.1 silent-bot P0 happened
+    because the input pump task spawned and called
+    ``send_audio_chunk`` into an as-yet-unopened socket BEFORE
+    ``connect()`` returned. The fence proved here is: ``connect``
+    MUST be the first backend method observed, and MUST be called
+    exactly once.
+    """
+    calls: list = []
+    backend = _make_realtime_backend(calls)
+    spec = _spec(VoiceMode.REALTIME, system_prompt="hi", voice="alloy")
+
+    # bridge=object() suppresses the optional RealtimeAudioBridge
+    # construction path — the backend mock is sufficient to prove
+    # the fence at the session layer.
+    session = RealtimeSession(spec, backend=backend, bridge=object())
+    try:
+        await session.start()
+
+        # THE FENCE ASSERT: first backend method called must be connect.
+        assert calls, "no backend method was called during start()"
+        assert calls[0] == "connect", (
+            f"connect must be the FIRST backend method called, "
+            f"got order: {calls!r}"
+        )
+        # connect must not be re-called by the pumps.
+        assert calls.count("connect") == 1, (
+            f"connect must be called exactly once, got: {calls!r}"
+        )
+        # Both pump-started markers must have appeared AFTER connect.
+        assert "pump_input_started" in calls[1:], (
+            f"input pump never called send_audio_chunk after connect; "
+            f"order: {calls!r}"
+        )
+        assert "pump_output_started" in calls[1:], (
+            f"output pump never called recv_events after connect; "
+            f"order: {calls!r}"
+        )
+    finally:
+        await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_realtime_session_failed_start_cleans_up():
+    """If RealtimeSession.start() raises partway, stop() must still safely unwind.
+
+    The AsyncExitStack lifecycle (research-15 §2) requires that any
+    cleanup callbacks registered *before* the failing step get
+    invoked, and that the session ends up in a stopped state.
+
+    Distinct from ``test_session_failed_start_cleans_up`` (W1a, M1.2),
+    which exercises the same discipline at the base-class layer with
+    a :class:`_DummySession`. This test exercises it on the real
+    :class:`RealtimeSession` using a backend whose ``connect()``
+    raises — the same shape the v0.3.1 P0 hit in production.
+    """
+    backend = MagicMock()
+    # connect raises — simulates a gateway-down / bad-API-key boot.
+    backend.connect = AsyncMock(
+        side_effect=RuntimeError("simulated connect failure")
+    )
+    backend.send_audio_chunk = AsyncMock()
+    backend.recv_events = MagicMock()
+    backend.close = AsyncMock()
+
+    spec = _spec(VoiceMode.REALTIME)
+    session = RealtimeSession(spec, backend=backend, bridge=object())
+
+    with pytest.raises(RuntimeError, match="simulated connect failure"):
+        await session.start()
+
+    # stop() must be safe to call even after a failed start.
+    await session.stop()
+    # And idempotent.
+    await session.stop()
+
+    # No pump tasks should have spawned — the fence held.
+    backend.send_audio_chunk.assert_not_called()
+    backend.recv_events.assert_not_called()
+
+
+# --- M1.6: S2SServerSession ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_s2s_server_session_smoke():
+    """S2SServerSession start/stop smoke with a mock backend."""
+    backend = MagicMock()
+    backend.endpoint = "ws://127.0.0.1:9999"
+    backend.connect = AsyncMock()
+    backend.close = AsyncMock()
+
+    spec = _spec(VoiceMode.S2S_SERVER, endpoint="ws://127.0.0.1:9999")
+    session = S2SServerSession(spec, backend=backend)
+    assert session.mode is VoiceMode.S2S_SERVER
+
+    await session.start()
+    backend.connect.assert_awaited_once()
+
+    await session.stop()
+    backend.close.assert_awaited_once()
+
+    # Idempotent stop.
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_s2s_server_session_smoke_without_connect_method():
+    """Backend without a connect() method still starts & stops cleanly.
+
+    The reference S2SServerPipeline stub doesn't expose connect() —
+    the session must tolerate that (connect is optional, per module
+    docstring).
+    """
+    backend = MagicMock(spec=["endpoint", "close"])
+    backend.endpoint = "ws://local"
+    backend.close = AsyncMock()
+
+    spec = _spec(VoiceMode.S2S_SERVER, endpoint="ws://local")
+    session = S2SServerSession(spec, backend=backend)
+
+    await session.start()
+    await session.stop()
+    backend.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # VoiceSession base class — lifecycle + state machine (M1.2)
 # ---------------------------------------------------------------------------
 
