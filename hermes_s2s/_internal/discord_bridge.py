@@ -85,6 +85,14 @@ _BRIDGE_WRAPPED_MARKER = "__hermes_s2s_voice_bridge__"
 _S2S_LEAVE_WRAPPED_MARKER = "__hermes_s2s_leave_wrapped__"
 # Marker on a VoiceReceiver instance so we only install our frame shim once.
 _FRAME_CB_INSTALLED_MARKER = "__hermes_s2s_frame_cb_installed__"
+# Marker on the AIAgentRunner class so the runner-level monkey-patch that
+# wires thread resolution into ``_handle_voice_channel_join`` is idempotent.
+# See B6 fixup / research-14 §2 — runner site has the ``event`` object and
+# runs BEFORE the source snapshot at ``adapter._voice_sources[guild_id] =
+# event.source.to_dict()``, which is the correct place to mutate
+# ``event.source.thread_id`` / ``chat_type`` so Hermes core routes the
+# synthetic voice MessageEvents into the target thread.
+_S2S_RUNNER_WRAPPED = "__hermes_s2s_runner_wrapped__"
 
 # English-anchored default voice-assistant prompt. Mirrors cli.py's wizard
 # default. Gemini Live native-audio models auto-detect language from input
@@ -340,8 +348,203 @@ def _install_via_monkey_patch(ctx: Any = None) -> None:
     # Wrap leave_voice_channel once per adapter class for bridge cleanup.
     _wrap_leave_voice_channel(DiscordAdapter)
 
+    # B6 fixup — wrap the runner's _handle_voice_channel_join too. This is
+    # the authoritative site for thread resolution because it has the
+    # ``event`` object and runs BEFORE the source snapshot at
+    # ``adapter._voice_sources[guild_id] = event.source.to_dict()``. The
+    # adapter-level ``_resolve_and_mirror_thread`` above is kept as a
+    # defense-in-depth fallback (e.g. for programmatic joins that bypass
+    # the runner, or future Hermes versions that move the site).
+    _wrap_runner_handle_voice_channel_join()
+
     logger.info(
         "hermes-s2s: patched DiscordAdapter.join_voice_channel for realtime bridge"
+    )
+
+
+def _wrap_runner_handle_voice_channel_join() -> None:
+    """Monkey-patch ``AIAgentRunner._handle_voice_channel_join`` for threads.
+
+    The adapter-level wrap of ``join_voice_channel`` does not have access
+    to the originating ``MessageEvent`` — Hermes core doesn't stash it on
+    the adapter before invoking the adapter method. The runner method
+    (``gateway/run.py:_handle_voice_channel_join``) DOES have the event,
+    and — crucially — runs BEFORE the line that snapshots the source
+    into ``adapter._voice_sources[guild_id]``. That snapshot is what
+    Hermes uses to construct synthetic MessageEvents for subsequent
+    voice utterances, so mutating ``event.source.thread_id`` /
+    ``chat_type`` here is what actually routes transcripts into the
+    correct thread.
+
+    Runner method signature (verified against Hermes
+    gateway/run.py:9125):
+
+        async def _handle_voice_channel_join(self, event: MessageEvent) -> str: ...
+
+    Success/failure is conveyed via the return string — success returns
+    a message starting with "Joined voice channel **...**."; failures
+    return strings starting with "Failed", "You need", "This command",
+    "Not in", or "Voice channels are not supported". We treat any return
+    that starts with "Joined" as success.
+
+    Idempotent via :data:`_S2S_RUNNER_WRAPPED` marker on the class.
+    """
+    try:
+        import gateway.run as hermes_run  # type: ignore[import-not-found]
+    except ImportError as exc:
+        logger.warning(
+            "hermes-s2s: could not import gateway.run for runner-level thread "
+            "patch (%s); adapter-level fallback will handle thread resolution "
+            "but may miss cases where adapter._current_event is unset.",
+            exc,
+        )
+        return
+
+    Runner = getattr(hermes_run, "AIAgentRunner", None)
+    if Runner is None:
+        logger.warning(
+            "hermes-s2s: AIAgentRunner not found in gateway.run; skipping "
+            "runner-level thread patch. %s",
+            _UPSTREAM_PR_URL,
+        )
+        return
+
+    if getattr(Runner, _S2S_RUNNER_WRAPPED, False):
+        logger.debug("hermes-s2s: runner-level thread patch already installed")
+        return
+
+    original_handler = getattr(Runner, "_handle_voice_channel_join", None)
+    if original_handler is None:
+        logger.warning(
+            "hermes-s2s: AIAgentRunner._handle_voice_channel_join not found; "
+            "Hermes internals may have moved. %s",
+            _UPSTREAM_PR_URL,
+        )
+        return
+
+    async def _handle_voice_channel_join_wrapped(self, event):  # type: ignore[no-untyped-def]
+        # Let the original runner method do its job (permission checks,
+        # adapter.join_voice_channel call, callback wiring, source
+        # snapshot). If it succeeds, we mutate the snapshot in place so
+        # future voice events inherit the thread context.
+        result = await original_handler(self, event)
+
+        # The runner returns a user-facing string. Success is the
+        # "Joined voice channel" branch; everything else is a refusal
+        # or failure and we skip thread resolution.
+        if not (isinstance(result, str) and result.startswith("Joined voice channel")):
+            return result
+
+        try:
+            adapter = self.adapters.get(event.source.platform)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "hermes-s2s: runner wrap could not resolve adapter: %s", exc
+            )
+            return result
+
+        if adapter is None:
+            return result
+
+        # Re-resolve the voice channel to pass to ThreadResolver. The
+        # runner already did this to call adapter.join_voice_channel;
+        # we repeat it so ThreadResolver can inspect the parent channel.
+        try:
+            guild_id = self._get_guild_id(event)
+        except Exception:  # noqa: BLE001
+            guild_id = None
+
+        voice_channel = None
+        if guild_id is not None and hasattr(adapter, "get_user_voice_channel"):
+            try:
+                voice_channel = await adapter.get_user_voice_channel(
+                    guild_id, event.source.user_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "hermes-s2s: runner wrap get_user_voice_channel failed: %s",
+                    exc,
+                )
+
+        try:
+            from ..config import load_config
+
+            cfg = load_config()
+            cfg_dict = cfg.dict() if hasattr(cfg, "dict") else {}
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(
+                "hermes-s2s: runner wrap config load failed (%s); "
+                "using default thread-resolver config",
+                exc,
+            )
+            cfg_dict = {}
+
+        resolver = ThreadResolver(cfg_dict)
+        try:
+            thread_id = await resolver.resolve(adapter, event, voice_channel)
+        except Exception as exc:  # noqa: BLE001 — never break voice join
+            logger.warning(
+                "hermes-s2s: runner wrap ThreadResolver.resolve failed: %s", exc
+            )
+            return result
+
+        if thread_id is None:
+            return result
+
+        # Mutate event.source — this is the critical step. The snapshot
+        # the runner just took at ``adapter._voice_sources[guild_id] =
+        # event.source.to_dict()`` was BEFORE we ran. We have two jobs:
+        #   (a) mutate the live event (for any logic reading it later);
+        #   (b) re-snapshot into adapter._voice_sources so subsequent
+        #       voice MessageEvents inherit the thread.
+        source = getattr(event, "source", None)
+        if source is not None:
+            try:
+                setattr(source, "thread_id", str(thread_id))
+                setattr(source, "chat_type", "thread")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "hermes-s2s: runner wrap could not mutate event.source "
+                    "(possibly frozen): %s",
+                    exc,
+                )
+
+        # Re-snapshot so voice utterances see the thread.
+        voice_sources = getattr(adapter, "_voice_sources", None)
+        if voice_sources is not None and guild_id is not None and source is not None:
+            try:
+                voice_sources[guild_id] = source.to_dict()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "hermes-s2s: runner wrap could not re-snapshot source: %s",
+                    exc,
+                )
+
+        # Stash a mirror too so the audio bridge / transcript wiring can
+        # find it if it runs after this point.
+        try:
+            from hermes_s2s.voice.transcript import TranscriptMirror
+
+            mirrors = getattr(adapter, "_s2s_transcript_mirrors", None)
+            if mirrors is None:
+                mirrors = {}
+                try:
+                    adapter._s2s_transcript_mirrors = mirrors
+                except Exception:  # pragma: no cover
+                    pass
+            if guild_id is not None:
+                mirrors[guild_id] = (TranscriptMirror(adapter), thread_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("hermes-s2s: runner wrap mirror stash failed: %s", exc)
+
+        return result
+
+    setattr(_handle_voice_channel_join_wrapped, _S2S_RUNNER_WRAPPED, True)
+    Runner._handle_voice_channel_join = _handle_voice_channel_join_wrapped
+    setattr(Runner, _S2S_RUNNER_WRAPPED, True)
+    logger.info(
+        "hermes-s2s: patched AIAgentRunner._handle_voice_channel_join for "
+        "thread resolution (B6 fixup)"
     )
 
 
