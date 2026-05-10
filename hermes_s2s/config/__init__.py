@@ -177,17 +177,45 @@ def load_config(path: Path | None = None) -> S2SConfig:
     """
     config_path = path or CONFIG_PATH
     if not config_path.exists():
+        # Fresh install / no config file — empty config is fine.
         return S2SConfig.from_dict({})
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-    except Exception:
-        return S2SConfig.from_dict({})
+    except yaml.YAMLError as exc:
+        # Phase-8 final security review P0-4: previously the broad
+        # except-and-return-empty path silently ate YAML syntax errors,
+        # which meant a typo'd config would boot a fresh empty config
+        # and the user had no idea why their settings didn't apply.
+        # Surface it loud and raise — this is *their* config file,
+        # they need to fix it.
+        logger.error(
+            "hermes-s2s: failed to parse YAML config at %s: %s",
+            config_path,
+            exc,
+        )
+        raise
+    except OSError as exc:
+        # Permission-denied / disk errors / unreadable files — same
+        # principle: don't silently fall through to empty config, raise
+        # so the user knows their config couldn't be read.
+        logger.error(
+            "hermes-s2s: failed to read config at %s: %s",
+            config_path,
+            exc,
+        )
+        raise
 
     if isinstance(data, dict):
         # Resolve HERMES_HOME fresh each call so tests can monkeypatch
         # the module-level HERMES_HOME constant.
         hermes_home = HERMES_HOME if path is None else config_path.parent
         data = _maybe_auto_migrate(config_path, hermes_home, data)
+    else:
+        # Non-dict top-level (e.g. a top-level YAML list) — treat as
+        # empty so downstream .get() calls don't explode. This is not
+        # a parse error; yaml.safe_load succeeded, the user just wrote
+        # a list where we expected a mapping.
+        data = {}
 
     return S2SConfig.from_dict(data.get("s2s", {}) or {})
