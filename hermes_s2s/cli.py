@@ -258,6 +258,40 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return base
 
 
+def _maybe_warn_legacy_s2s_mode(cfg_path: Path, existing: dict) -> None:
+    """Emit a one-time warning when the legacy `s2s.mode` key is detected.
+
+    Gated by the same `.s2s_migrated_0_4` sentinel as the auto-translate
+    fallback in :mod:`hermes_s2s.config` so the warning fires at most once
+    per machine. Silent no-op on a 0.4.0-shaped config or when the sentinel
+    already exists.
+    """
+    s2s = existing.get("s2s") if isinstance(existing, dict) else None
+    if not isinstance(s2s, dict):
+        return
+    if not isinstance(s2s.get("mode"), str) or not s2s["mode"].strip():
+        return
+    voice = s2s.get("voice")
+    if isinstance(voice, dict) and voice.get("default_mode"):
+        # Already on 0.4.0 shape; legacy key preserved for compat.
+        return
+
+    try:
+        from .migrate_0_4 import SENTINEL_NAME
+    except Exception:  # pragma: no cover - defensive
+        SENTINEL_NAME = ".s2s_migrated_0_4"
+    sentinel = cfg_path.parent / SENTINEL_NAME
+    if sentinel.exists():
+        return
+
+    print(
+        "hermes-s2s: detected legacy `s2s.mode` in your config.yaml. "
+        "Run `python -m hermes_s2s.migrate_0_4` to translate it to "
+        "`s2s.voice.default_mode` (the 0.4.0 shape).",
+        file=sys.stderr,
+    )
+
+
 def _write_env_command(env_path: Path, command: str) -> bool:
     """Append HERMES_LOCAL_STT_COMMAND to .env idempotently. Returns True if written."""
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +340,14 @@ def setup_argparse(subparser: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="Print the config that would be written; don't modify files",
+    )
+    p_setup.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Destructive: overwrite s2s/tts/stt sections from scratch instead "
+            "of deep-merging into existing config (opt-in; default is additive)."
+        ),
     )
     p_setup.add_argument(
         "--config-path",
@@ -387,6 +429,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
         loaded = yaml.safe_load(cfg_path.read_text()) or {}
         if isinstance(loaded, dict):
             existing = loaded
+
+    # One-time deprecation warning when the legacy s2s.mode key is still
+    # present on disk (sentinel-gated). This complements the auto-translate
+    # fallback in hermes_s2s.config.load_config.
+    _maybe_warn_legacy_s2s_mode(cfg_path, existing)
+
+    if getattr(args, "reset", False):
+        # Destructive path: strip the sections the wizard owns before merging
+        # so the new values fully replace the old block.
+        for section in ("s2s", "tts", "stt"):
+            if section in new_config and section in existing:
+                existing.pop(section, None)
     merged = _deep_merge(existing, new_config)
     cfg_path.write_text(yaml.safe_dump(merged, sort_keys=False))
     print(f"Wrote {cfg_path}")
@@ -471,6 +525,7 @@ if __name__ == "__main__":
     p_setup.add_argument("--profile")
     p_setup.add_argument("--config-path")
     p_setup.add_argument("--dry-run", action="store_true")
+    p_setup.add_argument("--reset", action="store_true")
     p_doctor = subs.add_parser("doctor")
     p_doctor.add_argument("--json", action="store_true")
     p_doctor.add_argument("--no-probe", action="store_true")
