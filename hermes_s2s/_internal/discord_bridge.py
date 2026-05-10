@@ -53,7 +53,17 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Tuple
+from functools import partial
+from typing import Any, Optional, Tuple
+
+from hermes_s2s.voice import (
+    CapabilityError,
+    ModeRouter,
+    VoiceMode,
+    VoiceSessionFactory,
+)
+from hermes_s2s.voice.threads import ThreadResolver
+from hermes_s2s.voice.transcript import TranscriptMirror
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +85,14 @@ _BRIDGE_WRAPPED_MARKER = "__hermes_s2s_voice_bridge__"
 _S2S_LEAVE_WRAPPED_MARKER = "__hermes_s2s_leave_wrapped__"
 # Marker on a VoiceReceiver instance so we only install our frame shim once.
 _FRAME_CB_INSTALLED_MARKER = "__hermes_s2s_frame_cb_installed__"
+# Marker on the AIAgentRunner class so the runner-level monkey-patch that
+# wires thread resolution into ``_handle_voice_channel_join`` is idempotent.
+# See B6 fixup / research-14 §2 — runner site has the ``event`` object and
+# runs BEFORE the source snapshot at ``adapter._voice_sources[guild_id] =
+# event.source.to_dict()``, which is the correct place to mutate
+# ``event.source.thread_id`` / ``chat_type`` so Hermes core routes the
+# synthetic voice MessageEvents into the target thread.
+_S2S_RUNNER_WRAPPED = "__hermes_s2s_runner_wrapped__"
 
 # English-anchored default voice-assistant prompt. Mirrors cli.py's wizard
 # default. Gemini Live native-audio models auto-detect language from input
@@ -119,6 +137,85 @@ def _resolve_bridge_params(cfg: Any) -> Tuple[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# CapabilityError rollback (Phase-8 P1-F7)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_capability_error_rollback(
+    adapter: Any, channel: Any, cap_exc: CapabilityError
+) -> None:
+    """Roll back a VC join when the factory rejected the mode.
+
+    Called from the outermost wrapper of ``join_voice_channel`` when
+    :func:`_install_bridge_on_adapter` raises :class:`CapabilityError`.
+    Responsibilities:
+
+    1. If the VoiceClient for this guild is connected, call
+       ``voice_client.disconnect()`` to roll back.
+    2. Post a user-friendly message to the adapter's bound text channel
+       for this guild (``adapter._voice_text_channels[guild_id]``) when
+       available; fall back to logging otherwise.
+    3. NEVER re-raise — returning normally prevents the exception from
+       propagating into discord.py's callback machinery.
+    """
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+
+    # Roll back the VC connection.
+    voice_clients = getattr(adapter, "_voice_clients", {}) or {}
+    vc = voice_clients.get(guild_id) if guild_id is not None else None
+    if vc is not None:
+        try:
+            is_connected = getattr(vc, "is_connected", None)
+            connected = bool(is_connected()) if callable(is_connected) else True
+            if connected:
+                disconnect = getattr(vc, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        result = disconnect()
+                        if hasattr(result, "__await__"):
+                            await result
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            "hermes-s2s: voice_client.disconnect() raised during "
+                            "CapabilityError rollback: %s",
+                            exc,
+                        )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "hermes-s2s: unexpected error while rolling back VC: %s", exc
+            )
+
+    # Post user-friendly message to the bound text channel, if any.
+    try:
+        text_chans = getattr(adapter, "_voice_text_channels", {}) or {}
+        chat_id = text_chans.get(guild_id) if guild_id is not None else None
+        if chat_id is not None:
+            sender = getattr(adapter, "_send_text", None) or getattr(
+                adapter, "send_text", None
+            )
+            if callable(sender):
+                try:
+                    msg_result = sender(chat_id, cap_exc.user_message())
+                    if hasattr(msg_result, "__await__"):
+                        await msg_result
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "hermes-s2s: failed to post CapabilityError message: %s", exc
+                    )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("hermes-s2s: text-channel notify best-effort failed: %s", exc)
+
+    logger.warning(
+        "hermes-s2s: refused to attach bridge due to CapabilityError "
+        "(mode=%s, missing=%s); VC rolled back. %s",
+        cap_exc.mode.value,
+        cap_exc.missing,
+        cap_exc,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -149,6 +246,20 @@ def install_discord_voice_bridge(ctx: Any) -> None:
             _install_via_monkey_patch(ctx)
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("hermes-s2s: Discord voice bridge install failed: %s", exc)
+
+        # W2a M2.1: install the plugin-owned /s2s slash command. Failure
+        # here is non-fatal — the voice bridge itself works without it,
+        # users just lose the mode-picker UX.
+        try:
+            from hermes_s2s.voice.slash import install_s2s_command
+
+            install_s2s_command(ctx)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: /s2s slash command install failed (voice bridge "
+                "still active, just no mode picker): %s",
+                exc,
+            )
         return
 
     # Strategy default — no-op
@@ -204,11 +315,29 @@ def _install_via_monkey_patch(ctx: Any = None) -> None:
         return
 
     async def join_voice_channel_wrapped(self, channel):  # type: ignore[no-untyped-def]
-        # Let Hermes do its normal connect + VoiceReceiver setup first.
+        # W3b M3.4 — resolve target thread + construct a TranscriptMirror
+        # BEFORE the original join runs so Hermes core's runner sees the
+        # thread context when it snapshots event.source. Best-effort:
+        # failures are logged inside the helper and don't block the VC
+        # join (voice still works; only the text-mirror is lost).
+        try:
+            await _resolve_and_mirror_thread(self, channel)
+        except Exception as exc:  # noqa: BLE001 — never break voice join
+            logger.warning(
+                "hermes-s2s: pre-join thread resolution failed: %s", exc
+            )
+
+        # Let Hermes do its normal connect + VoiceReceiver setup.
         result = await original(self, channel)
         if result:
             try:
                 _install_bridge_on_adapter(self, channel, ctx)
+            except CapabilityError as cap_exc:
+                # Phase-8 P1-F7: the factory refused to build because the
+                # explicitly-requested mode is unavailable. Roll back the
+                # VC join and post a user-friendly message; NEVER let
+                # CapabilityError propagate into discord.py callbacks.
+                await _handle_capability_error_rollback(self, channel, cap_exc)
             except Exception as exc:
                 logger.warning("hermes-s2s: voice bridge attach failed: %s", exc)
         return result
@@ -219,8 +348,203 @@ def _install_via_monkey_patch(ctx: Any = None) -> None:
     # Wrap leave_voice_channel once per adapter class for bridge cleanup.
     _wrap_leave_voice_channel(DiscordAdapter)
 
+    # B6 fixup — wrap the runner's _handle_voice_channel_join too. This is
+    # the authoritative site for thread resolution because it has the
+    # ``event`` object and runs BEFORE the source snapshot at
+    # ``adapter._voice_sources[guild_id] = event.source.to_dict()``. The
+    # adapter-level ``_resolve_and_mirror_thread`` above is kept as a
+    # defense-in-depth fallback (e.g. for programmatic joins that bypass
+    # the runner, or future Hermes versions that move the site).
+    _wrap_runner_handle_voice_channel_join()
+
     logger.info(
         "hermes-s2s: patched DiscordAdapter.join_voice_channel for realtime bridge"
+    )
+
+
+def _wrap_runner_handle_voice_channel_join() -> None:
+    """Monkey-patch ``AIAgentRunner._handle_voice_channel_join`` for threads.
+
+    The adapter-level wrap of ``join_voice_channel`` does not have access
+    to the originating ``MessageEvent`` — Hermes core doesn't stash it on
+    the adapter before invoking the adapter method. The runner method
+    (``gateway/run.py:_handle_voice_channel_join``) DOES have the event,
+    and — crucially — runs BEFORE the line that snapshots the source
+    into ``adapter._voice_sources[guild_id]``. That snapshot is what
+    Hermes uses to construct synthetic MessageEvents for subsequent
+    voice utterances, so mutating ``event.source.thread_id`` /
+    ``chat_type`` here is what actually routes transcripts into the
+    correct thread.
+
+    Runner method signature (verified against Hermes
+    gateway/run.py:9125):
+
+        async def _handle_voice_channel_join(self, event: MessageEvent) -> str: ...
+
+    Success/failure is conveyed via the return string — success returns
+    a message starting with "Joined voice channel **...**."; failures
+    return strings starting with "Failed", "You need", "This command",
+    "Not in", or "Voice channels are not supported". We treat any return
+    that starts with "Joined" as success.
+
+    Idempotent via :data:`_S2S_RUNNER_WRAPPED` marker on the class.
+    """
+    try:
+        import gateway.run as hermes_run  # type: ignore[import-not-found]
+    except ImportError as exc:
+        logger.warning(
+            "hermes-s2s: could not import gateway.run for runner-level thread "
+            "patch (%s); adapter-level fallback will handle thread resolution "
+            "but may miss cases where adapter._current_event is unset.",
+            exc,
+        )
+        return
+
+    Runner = getattr(hermes_run, "AIAgentRunner", None)
+    if Runner is None:
+        logger.warning(
+            "hermes-s2s: AIAgentRunner not found in gateway.run; skipping "
+            "runner-level thread patch. %s",
+            _UPSTREAM_PR_URL,
+        )
+        return
+
+    if getattr(Runner, _S2S_RUNNER_WRAPPED, False):
+        logger.debug("hermes-s2s: runner-level thread patch already installed")
+        return
+
+    original_handler = getattr(Runner, "_handle_voice_channel_join", None)
+    if original_handler is None:
+        logger.warning(
+            "hermes-s2s: AIAgentRunner._handle_voice_channel_join not found; "
+            "Hermes internals may have moved. %s",
+            _UPSTREAM_PR_URL,
+        )
+        return
+
+    async def _handle_voice_channel_join_wrapped(self, event):  # type: ignore[no-untyped-def]
+        # Let the original runner method do its job (permission checks,
+        # adapter.join_voice_channel call, callback wiring, source
+        # snapshot). If it succeeds, we mutate the snapshot in place so
+        # future voice events inherit the thread context.
+        result = await original_handler(self, event)
+
+        # The runner returns a user-facing string. Success is the
+        # "Joined voice channel" branch; everything else is a refusal
+        # or failure and we skip thread resolution.
+        if not (isinstance(result, str) and result.startswith("Joined voice channel")):
+            return result
+
+        try:
+            adapter = self.adapters.get(event.source.platform)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "hermes-s2s: runner wrap could not resolve adapter: %s", exc
+            )
+            return result
+
+        if adapter is None:
+            return result
+
+        # Re-resolve the voice channel to pass to ThreadResolver. The
+        # runner already did this to call adapter.join_voice_channel;
+        # we repeat it so ThreadResolver can inspect the parent channel.
+        try:
+            guild_id = self._get_guild_id(event)
+        except Exception:  # noqa: BLE001
+            guild_id = None
+
+        voice_channel = None
+        if guild_id is not None and hasattr(adapter, "get_user_voice_channel"):
+            try:
+                voice_channel = await adapter.get_user_voice_channel(
+                    guild_id, event.source.user_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "hermes-s2s: runner wrap get_user_voice_channel failed: %s",
+                    exc,
+                )
+
+        try:
+            from ..config import load_config
+
+            cfg = load_config()
+            cfg_dict = cfg.dict() if hasattr(cfg, "dict") else {}
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(
+                "hermes-s2s: runner wrap config load failed (%s); "
+                "using default thread-resolver config",
+                exc,
+            )
+            cfg_dict = {}
+
+        resolver = ThreadResolver(cfg_dict)
+        try:
+            thread_id = await resolver.resolve(adapter, event, voice_channel)
+        except Exception as exc:  # noqa: BLE001 — never break voice join
+            logger.warning(
+                "hermes-s2s: runner wrap ThreadResolver.resolve failed: %s", exc
+            )
+            return result
+
+        if thread_id is None:
+            return result
+
+        # Mutate event.source — this is the critical step. The snapshot
+        # the runner just took at ``adapter._voice_sources[guild_id] =
+        # event.source.to_dict()`` was BEFORE we ran. We have two jobs:
+        #   (a) mutate the live event (for any logic reading it later);
+        #   (b) re-snapshot into adapter._voice_sources so subsequent
+        #       voice MessageEvents inherit the thread.
+        source = getattr(event, "source", None)
+        if source is not None:
+            try:
+                setattr(source, "thread_id", str(thread_id))
+                setattr(source, "chat_type", "thread")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "hermes-s2s: runner wrap could not mutate event.source "
+                    "(possibly frozen): %s",
+                    exc,
+                )
+
+        # Re-snapshot so voice utterances see the thread.
+        voice_sources = getattr(adapter, "_voice_sources", None)
+        if voice_sources is not None and guild_id is not None and source is not None:
+            try:
+                voice_sources[guild_id] = source.to_dict()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "hermes-s2s: runner wrap could not re-snapshot source: %s",
+                    exc,
+                )
+
+        # Stash a mirror too so the audio bridge / transcript wiring can
+        # find it if it runs after this point.
+        try:
+            from hermes_s2s.voice.transcript import TranscriptMirror
+
+            mirrors = getattr(adapter, "_s2s_transcript_mirrors", None)
+            if mirrors is None:
+                mirrors = {}
+                try:
+                    adapter._s2s_transcript_mirrors = mirrors
+                except Exception:  # pragma: no cover
+                    pass
+            if guild_id is not None:
+                mirrors[guild_id] = (TranscriptMirror(adapter), thread_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("hermes-s2s: runner wrap mirror stash failed: %s", exc)
+
+        return result
+
+    setattr(_handle_voice_channel_join_wrapped, _S2S_RUNNER_WRAPPED, True)
+    Runner._handle_voice_channel_join = _handle_voice_channel_join_wrapped
+    setattr(Runner, _S2S_RUNNER_WRAPPED, True)
+    logger.info(
+        "hermes-s2s: patched AIAgentRunner._handle_voice_channel_join for "
+        "thread resolution (B6 fixup)"
     )
 
 
@@ -275,6 +599,99 @@ def _vtuple(v: str) -> Tuple[int, ...]:
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_and_mirror_thread(
+    adapter: Any, channel: Any
+) -> Optional[int]:
+    """Resolve a target thread + stash a TranscriptMirror on the adapter.
+
+    W3b M3.4 — called from the wrapped ``join_voice_channel`` BEFORE the
+    original join runs so Hermes core's runner snapshots the thread
+    context when it captures ``event.source``. Returns the resolved
+    thread_id (int) or ``None`` if no thread could be resolved (forum
+    parent, missing event, resolver failure).
+
+    The helper is defensive in the face of missing adapter state —
+    voice joins invoked outside of a normal message-event flow (e.g. a
+    programmatic call) won't have a ``_current_event`` on the adapter,
+    in which case we skip thread resolution entirely rather than crash.
+
+    Side effects:
+        * On success, mutates ``event.source.thread_id`` and
+          ``event.source.chat_type``. ``SessionSource`` may be frozen
+          in some Hermes versions; we use ``setattr`` defensively and
+          catch the AttributeError-on-frozen-dataclass path.
+        * Stashes a ``TranscriptMirror`` on
+          ``adapter._s2s_transcript_mirrors`` keyed on ``guild_id`` so
+          ``_attach_realtime_to_voice_client`` can wire the sink after
+          the factory builds the session.
+    """
+    event = (
+        getattr(adapter, "_current_event", None)
+        or getattr(adapter, "_pending_voice_event", None)
+    )
+    if event is None:
+        logger.debug(
+            "hermes-s2s.discord_bridge: no current event on adapter; "
+            "skipping thread resolution (voice still works, no mirror)"
+        )
+        return None
+
+    try:
+        from ..config import load_config
+
+        cfg = load_config()
+        cfg_dict = cfg.dict() if hasattr(cfg, "dict") else {}
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug(
+            "hermes-s2s.discord_bridge: config load failed (%s); "
+            "using default thread-resolver config",
+            exc,
+        )
+        cfg_dict = {}
+
+    resolver = ThreadResolver(cfg_dict)
+    try:
+        thread_id = await resolver.resolve(adapter, event, channel)
+    except Exception as exc:  # noqa: BLE001 — never break voice join
+        logger.warning(
+            "hermes-s2s.discord_bridge: ThreadResolver.resolve failed: %s", exc
+        )
+        return None
+
+    if thread_id is None:
+        return None
+
+    # Mutate event.source — defensive because SessionSource may be
+    # frozen in some Hermes versions.
+    source = getattr(event, "source", None)
+    if source is not None:
+        try:
+            setattr(source, "thread_id", str(thread_id))
+            setattr(source, "chat_type", "thread")
+        except Exception as exc:  # noqa: BLE001 — frozen-dataclass tolerant
+            logger.debug(
+                "hermes-s2s.discord_bridge: could not mutate event.source "
+                "(possibly frozen): %s",
+                exc,
+            )
+
+    # Stash a mirror on the adapter keyed by guild for the attach step.
+    mirror = TranscriptMirror(adapter)
+    mirrors = getattr(adapter, "_s2s_transcript_mirrors", None)
+    if mirrors is None:
+        mirrors = {}
+        try:
+            adapter._s2s_transcript_mirrors = mirrors
+        except Exception:  # pragma: no cover — defensive
+            pass
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if guild_id is not None:
+        mirrors[guild_id] = (mirror, thread_id)
+
+    return thread_id
+
+
 def _install_bridge_on_adapter(adapter: Any, channel: Any, ctx: Any = None) -> None:
     """Locate the VoiceClient + VoiceReceiver for ``channel`` and attach a bridge.
 
@@ -305,28 +722,40 @@ def _attach_realtime_to_voice_client(
 ) -> None:
     """Wire a :class:`RealtimeAudioBridge` between the Discord VC and the s2s backend.
 
-    Only runs when ``s2s.mode == 'realtime'``; cascaded mode is a no-op so
-    Hermes's built-in STT->text->TTS path stays untouched.
+    Only runs when the resolved :class:`VoiceMode` is ``REALTIME``;
+    cascaded / pipeline / s2s-server modes are either no-ops here
+    (cascaded) or handled by their own session lifecycle (pipeline /
+    s2s-server) — for all non-realtime modes we still register the
+    session on ``adapter._s2s_sessions`` via the factory so the leave-
+    voice-channel wrapper can stop them cleanly.
 
-    Flow (see ADR-0007 + wave-0.3.1 plan B3):
-      1. Load s2s config; bail early if mode != 'realtime'.
-      2. Resolve the realtime backend from the provider registry.
-      3. Build a HermesToolBridge (if ctx exposes ``dispatch_tool``).
-      4. Build a RealtimeAudioBridge wrapping both.
-      5. Install a per-frame PCM callback on the VoiceReceiver (see spike notes
-         at top of this module re: no public hook — we monkey-patch _on_packet).
-      6. Replace whatever the VoiceClient is playing with a QueuedPCMSource fed
-         from the bridge's outbound buffer.
-      7. Schedule ``bridge.start()`` on the voice_client's event loop.
-      8. Track the bridge on ``adapter._s2s_bridges[guild_id]`` for later cleanup.
+    Flow (see ADR-0013 §3 + ADR-0007 + wave-0.3.1 plan B3):
+      1. Load s2s config and resolve the target :class:`ModeSpec` via
+         :class:`ModeRouter`. This supports both the back-compat
+         ``s2s.mode`` key (legacy) and the new ``s2s.voice.default_mode``
+         key the wizard writes.
+      2. Build a HermesToolBridge (if ctx exposes ``dispatch_tool``).
+      3. Delegate construction to :class:`VoiceSessionFactory`.
+         CapabilityError propagates out so the outer wrapper rolls back
+         the VC join (Phase-8 P1-F7).
+      4. If the resulting session is a RealtimeSession, install the
+         frame callback + QueuedPCMSource + silence cascaded STT. Other
+         session types are left to their own ``start()`` to do mode-
+         specific setup.
+      5. Schedule ``session.start()`` on the voice_client's event loop.
+      6. Track the bridge on ``adapter._s2s_bridges[guild_id]`` for
+         legacy leave-voice-channel cleanup (preserved for back-compat).
+
+    v0.3.9 REGRESSION FENCE: the factory's RealtimeSession path calls
+    :func:`_resolve_bridge_params` internally to unwrap the provider
+    sub-block in ``realtime_options``. See ``tests/test_config_unwrap.py``.
     """
     # Lazy imports — these modules live under _internal/ and depend on the
     # optional realtime extras; keeping the import here means this module loads
     # cleanly even if audio_bridge/tool_bridge/discord_audio aren't installable.
     try:
         from ..config import load_config
-        from ..registry import resolve_realtime
-        from .audio_bridge import RealtimeAudioBridge
+        from .. import registry as registry_mod
         from .tool_bridge import HermesToolBridge
         from .discord_audio import QueuedPCMSource
         import asyncio
@@ -343,26 +772,85 @@ def _attach_realtime_to_voice_client(
         logger.warning("hermes-s2s: s2s config load failed: %s", exc)
         return
 
-    mode = str(getattr(cfg, "mode", "") or "").lower()
-    if mode != "realtime":
-        logger.debug(
-            "hermes-s2s: s2s.mode=%r — leaving Hermes's default STT/TTS path untouched",
-            mode,
-        )
-        return
+    # Build a ModeRouter config dict that supports both the back-compat
+    # ``s2s.mode`` key AND the new ``s2s.voice.default_mode`` key. The
+    # legacy string carries through as the default_mode fallback so
+    # existing 0.3.x deployments keep behaving identically.
+    legacy_mode = str(getattr(cfg, "mode", "") or "").strip().lower()
+    router_cfg: dict = {"s2s": {"voice": {}}}
+    # Merge any new-style s2s.voice.* config if the operator wrote it.
+    voice_cfg_obj = getattr(cfg, "voice", None)
+    if isinstance(voice_cfg_obj, dict):
+        router_cfg["s2s"]["voice"].update(voice_cfg_obj)
+    # Legacy s2s.mode wins only if voice.default_mode wasn't set.
+    if legacy_mode and "default_mode" not in router_cfg["s2s"]["voice"]:
+        router_cfg["s2s"]["voice"]["default_mode"] = legacy_mode
+    # Preserve provider info for realtime capability gating.
+    realtime_provider = getattr(cfg, "realtime_provider", None)
+    if realtime_provider:
+        router_cfg["s2s"]["voice"].setdefault("provider", realtime_provider)
 
-    # (b) Resolve backend
+    guild = getattr(voice_client, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    channel_obj = getattr(voice_client, "channel", None)
+    channel_id = getattr(channel_obj, "id", None)
+
+    # W2a M2.1 part 3: fold the /s2s override store into the router's
+    # ``channel_overrides`` (precedence level 3). The store is the
+    # canonical persistence for per-channel picks made via the
+    # plugin-owned /s2s slash command. Reload on every join so another
+    # process (e.g. a fresh gateway start) writing an override while we
+    # were idle still takes effect. Failure is non-fatal — we just lose
+    # the override for this join.
     try:
-        backend = resolve_realtime(cfg.realtime_provider, cfg.realtime_options)
-    except Exception as exc:
-        logger.warning(
-            "hermes-s2s: failed to resolve realtime backend %r: %s",
-            getattr(cfg, "realtime_provider", "?"),
+        from ..voice.slash import get_default_store
+
+        store = get_default_store()
+        store.reload()
+        if guild_id is not None and channel_id is not None:
+            override = store.get(int(guild_id), int(channel_id))
+            if override:
+                router_cfg["s2s"]["voice"].setdefault(
+                    "channel_overrides", {}
+                )[channel_id] = override
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "hermes-s2s: override-store lookup failed (%s); continuing "
+            "without /s2s override",
             exc,
         )
+
+    try:
+        router = ModeRouter(router_cfg)
+        spec = router.resolve(guild_id=guild_id, channel_id=channel_id)
+    except Exception as exc:
+        logger.warning("hermes-s2s: ModeRouter.resolve() failed: %s", exc)
         return
 
-    # (c) Tool bridge — only if Hermes ctx exposes dispatch_tool
+    # For cascaded mode, we intentionally don't install a realtime bridge —
+    # Hermes core's native STT/TTS path owns the conversation. Still, we
+    # want the factory to register a CascadedSession so observability +
+    # leave-voice-channel cleanup are symmetric across modes.
+    if spec.mode is VoiceMode.CASCADED:
+        logger.debug(
+            "hermes-s2s: voice mode=%s — leaving Hermes's default STT/TTS path "
+            "untouched (will still register CascadedSession for observability)",
+            spec.mode.value,
+        )
+        try:
+            factory = VoiceSessionFactory(registry=registry_mod)
+            factory.build(spec, voice_client, adapter, ctx)
+        except CapabilityError:
+            # Cascaded has no capability requirements; this should be
+            # unreachable but propagate so the outer wrapper can log.
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: CascadedSession registration failed: %s", exc
+            )
+        return
+
+    # (b) Tool bridge — only if Hermes ctx exposes dispatch_tool
     tool_bridge = None
     if ctx is not None and hasattr(ctx, "dispatch_tool"):
         try:
@@ -371,22 +859,49 @@ def _attach_realtime_to_voice_client(
             logger.warning("hermes-s2s: tool bridge construction failed: %s", exc)
             tool_bridge = None
 
-    # (d) Audio bridge
-    # Pull system_prompt + voice via _resolve_bridge_params, which unwraps the
-    # provider sub-block (realtime_options['gemini_live'] / 'openai') where
-    # the wizard writes the anchored defaults. Outer-level read kept as a
-    # back-compat fallback for pre-0.3.8 flat configs. See
-    # docs/research/10-arabic-language-rootcause.md (Fix A).
-    system_prompt, voice = _resolve_bridge_params(cfg)
-    bridge = RealtimeAudioBridge(
-        backend=backend,
-        tool_bridge=tool_bridge,
-        system_prompt=system_prompt,
-        voice=voice,
-        tools=[],
-    )
+    # (c) Delegate construction to the factory. The factory:
+    #     - runs the capability gate (raises CapabilityError for
+    #       explicit-but-unavailable modes — caught by the outer wrapper);
+    #     - resolves the realtime backend via the registry;
+    #     - calls _resolve_bridge_params() to preserve the v0.3.9 wizard-
+    #       nested-config unwrap behavior;
+    #     - eagerly constructs a RealtimeAudioBridge so we can reach
+    #       session._bridge below for frame-callback / PCM-source wiring.
+    factory = VoiceSessionFactory(registry=registry_mod, tool_bridge=tool_bridge)
+    # CapabilityError intentionally propagates to the outer wrapper.
+    session = factory.build(spec, voice_client, adapter, ctx)
 
-    # (e) Frame callback — see SPIKE notes at top of module re: monkey-patch
+    # Non-realtime sessions (pipeline / s2s-server) — their _on_start
+    # does the mode-specific setup. Schedule start() and return.
+    if spec.mode is not VoiceMode.REALTIME:
+        try:
+            loop = getattr(voice_client, "loop", None)
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(session.start(), loop)
+            else:  # pragma: no cover - defensive
+                logger.warning(
+                    "hermes-s2s: voice_client.loop is None — cannot start %s session",
+                    spec.mode.value,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: scheduling %s session.start() failed: %s",
+                spec.mode.value,
+                exc,
+            )
+        return
+
+    # --- realtime-mode-specific glue below (frame cb + PCM source + TTS silencing) ---
+
+    bridge = getattr(session, "_bridge", None)
+    if bridge is None:
+        logger.warning(
+            "hermes-s2s: RealtimeSession has no _bridge — backend may be "
+            "unresolved; skipping frame/PCM wiring"
+        )
+        return
+
+    # (d) Frame callback — see SPIKE notes at top of module re: monkey-patch
     if voice_receiver is not None:
         try:
             _install_frame_callback(voice_receiver, bridge.on_user_frame)
@@ -395,7 +910,30 @@ def _attach_realtime_to_voice_client(
                 "hermes-s2s: failed to install frame callback on VoiceReceiver: %s", exc
             )
 
-    # (f) Outbound audio — route bridge buffer to the VoiceClient
+    # (d.5) W3b M3.4 — if a TranscriptMirror was stashed for this guild
+    # during the pre-join resolver step, install it as the bridge's
+    # transcript sink. The mirror's schedule_send is a SYNC callable
+    # that handles loop-scheduling internally, matching the bridge's
+    # `sink(*, role, text, final)` contract.
+    try:
+        mirrors = getattr(adapter, "_s2s_transcript_mirrors", None) or {}
+        slot = mirrors.get(guild_id) if guild_id is not None else None
+        if slot is not None:
+            mirror, thread_id = slot
+            bridge._transcript_sink = partial(
+                mirror.schedule_send, channel_id=int(thread_id)
+            )
+            logger.info(
+                "hermes-s2s: transcript mirror wired (guild=%s, thread=%s)",
+                guild_id,
+                thread_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "hermes-s2s: failed to wire transcript mirror: %s", exc
+        )
+
+    # (e) Outbound audio — route bridge buffer to the VoiceClient
     try:
         if voice_client.is_playing():
             voice_client.stop()
@@ -403,19 +941,22 @@ def _attach_realtime_to_voice_client(
     except Exception as exc:
         logger.warning("hermes-s2s: voice_client.play(QueuedPCMSource) failed: %s", exc)
 
-    # (g) Start the bridge loop on the VC's asyncio loop (thread-safe)
+    # (f) Start the session on the VC's asyncio loop (thread-safe). The
+    # session's connect-before-pumps fence (W1b M1.5) means bridge.start()
+    # doesn't race the backend handshake.
     try:
         loop = getattr(voice_client, "loop", None)
         if loop is not None:
-            asyncio.run_coroutine_threadsafe(bridge.start(), loop)
-        else:  # pragma: no cover — defensive (discord.VoiceClient always has .loop)
+            asyncio.run_coroutine_threadsafe(session.start(), loop)
+        else:  # pragma: no cover — defensive
             logger.warning(
-                "hermes-s2s: voice_client.loop is None — cannot start bridge"
+                "hermes-s2s: voice_client.loop is None — cannot start session"
             )
     except Exception as exc:  # pragma: no cover — defensive
-        logger.warning("hermes-s2s: scheduling bridge.start() failed: %s", exc)
+        logger.warning("hermes-s2s: scheduling session.start() failed: %s", exc)
 
-    # (h) Track on adapter for cleanup
+    # (g) Track bridge on adapter for legacy leave-voice-channel cleanup.
+    # This dict is still consumed by _wrap_leave_voice_channel below.
     bridges = getattr(adapter, "_s2s_bridges", None)
     if bridges is None:
         bridges = {}
@@ -423,12 +964,10 @@ def _attach_realtime_to_voice_client(
             adapter._s2s_bridges = bridges
         except Exception:  # pragma: no cover — defensive
             pass
-    guild = getattr(voice_client, "guild", None)
-    guild_id = getattr(guild, "id", None)
     if guild_id is not None:
         bridges[guild_id] = bridge
 
-    # (i) Silence Hermes core's cascaded voice loop while realtime is active.
+    # (h) Silence Hermes core's cascaded voice loop while realtime is active.
     # Hermes core wires:
     #   adapter._voice_input_callback = self._handle_voice_channel_input
     # which fires faster-whisper STT every time the VoiceReceiver flushes a
@@ -482,7 +1021,7 @@ def _attach_realtime_to_voice_client(
     logger.info(
         "hermes-s2s: realtime audio bridge attached (guild=%s, backend=%s)",
         guild_id,
-        getattr(cfg, "realtime_provider", None),
+        realtime_provider,
     )
 
 
@@ -683,6 +1222,39 @@ def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
                         await res
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("hermes-s2s: bridge.close() failed: %s", exc)
+
+        # P0-6: stop any S2S sessions registered for this guild on
+        # ``adapter._s2s_sessions``. Non-realtime modes (pipeline,
+        # s2s-server) track their session here so that /voice leave
+        # can shut them down cleanly — before P0-6 the sessions were
+        # orphaned when the user left the VC and kept holding their
+        # WS / subprocess resources open (see P0-6 in the 0.4.0 plan).
+        sessions_dict = getattr(self, "_s2s_sessions", None)
+        if sessions_dict:
+            for key in list(sessions_dict.keys()):
+                # Keys are (guild_id, channel_id) tuples; tolerate
+                # scalar keys too, for forwards-compat.
+                try:
+                    gid = key[0] if isinstance(key, tuple) else key
+                except Exception:  # pragma: no cover — defensive
+                    gid = None
+                if guild_id is not None and gid != guild_id:
+                    continue
+                session = sessions_dict.pop(key, None)
+                if session is None:
+                    continue
+                stop = getattr(session, "stop", None)
+                if not callable(stop):
+                    continue
+                try:
+                    res = stop()
+                    import inspect as _inspect
+                    if _inspect.isawaitable(res):
+                        await res
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.warning(
+                        "hermes-s2s: session.stop() failed: %s", exc
+                    )
 
         # Restore Hermes core's silenced cascaded callback (mirror of step (i)
         # in _attach_realtime_to_voice_client). If the user re-joins in

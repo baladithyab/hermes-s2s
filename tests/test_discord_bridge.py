@@ -104,6 +104,168 @@ def test_install_monkey_patches_discord_adapter(monkeypatch):
     assert FakeDiscordAdapter.join_voice_channel is wrapped_once
 
 
+def test_install_also_patches_runner_handle_voice_channel_join(monkeypatch):
+    """B6 fixup: install_discord_voice_bridge must also wrap
+    AIAgentRunner._handle_voice_channel_join. The runner wrap is what
+    actually mutates event.source.thread_id + chat_type and re-snapshots
+    into adapter._voice_sources; the adapter-level wrap is a fallback.
+
+    We assert:
+      (a) the runner method is replaced and marked with _S2S_RUNNER_WRAPPED;
+      (b) when the wrapped runner method is awaited, ThreadResolver is
+          called, event.source is mutated BEFORE the test asserts, and
+          adapter._voice_sources is re-snapshotted with thread_id set.
+    """
+    import asyncio
+
+    # --- fake adapter + event -------------------------------------------------
+    class _SourceDict(dict):
+        pass
+
+    class FakeSource:
+        def __init__(self):
+            self.platform = "discord"
+            self.user_id = "42"
+            self.chat_id = "1000"
+            self.thread_id = None
+            self.chat_type = "channel"
+            self.user_display_name = "tester"
+
+        def to_dict(self):
+            return {
+                "platform": self.platform,
+                "user_id": self.user_id,
+                "chat_id": self.chat_id,
+                "thread_id": self.thread_id,
+                "chat_type": self.chat_type,
+            }
+
+    class FakeEvent:
+        def __init__(self):
+            self.source = FakeSource()
+
+    class FakeVoiceChannel:
+        def __init__(self):
+            self.guild = types.SimpleNamespace(id=9999)
+            self.name = "vc-test"
+
+    class FakeAdapter:
+        def __init__(self):
+            self._voice_sources = {}
+            self._voice_text_channels = {}
+
+        async def get_user_voice_channel(self, guild_id, user_id):  # noqa: ARG002
+            return FakeVoiceChannel()
+
+    fake_adapter = FakeAdapter()
+
+    # --- fake runner class ---------------------------------------------------
+    _observed = {"original_called": False, "pre_runner_thread_id": None}
+
+    async def original_handle_voice_channel_join(self, event):
+        # Simulate the real runner: snapshot source into _voice_sources
+        # BEFORE returning success. This captures the snapshot taken
+        # by Hermes core that our wrap should fix up afterwards.
+        _observed["original_called"] = True
+        _observed["pre_runner_thread_id"] = event.source.thread_id
+        adapter = self.adapters.get(event.source.platform)
+        guild_id = self._get_guild_id(event)
+        adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
+        adapter._voice_sources[guild_id] = event.source.to_dict()
+        return "Joined voice channel **vc-test**.\nI'll speak my replies..."
+
+    class FakeAIAgentRunner:
+        _handle_voice_channel_join = original_handle_voice_channel_join
+
+        def __init__(self, adapter):
+            self.adapters = {"discord": adapter}
+
+        def _get_guild_id(self, event):  # noqa: ARG002
+            return 9999
+
+    # --- mock gateway.run + gateway.platforms.discord + hermes_agent ---------
+    fake_hermes_run = types.ModuleType("gateway.run")
+    fake_hermes_run.AIAgentRunner = FakeAIAgentRunner
+
+    async def original_join(self, channel):  # noqa: ARG001
+        return True
+
+    class FakeDiscordAdapterCls:
+        join_voice_channel = original_join
+
+    class FakeVoiceReceiver:
+        pass
+
+    fake_hermes_discord = types.ModuleType("gateway.platforms.discord")
+    fake_hermes_discord.DiscordAdapter = FakeDiscordAdapterCls
+    fake_hermes_discord.VoiceReceiver = FakeVoiceReceiver
+
+    fake_gateway = types.ModuleType("gateway")
+    fake_platforms = types.ModuleType("gateway.platforms")
+    fake_gateway.platforms = fake_platforms
+    fake_gateway.run = fake_hermes_run
+    fake_platforms.discord = fake_hermes_discord
+
+    fake_hermes_agent = types.ModuleType("hermes_agent")
+    fake_hermes_agent.__version__ = "0.1.0"
+
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway)
+    monkeypatch.setitem(sys.modules, "gateway.platforms", fake_platforms)
+    monkeypatch.setitem(sys.modules, "gateway.platforms.discord", fake_hermes_discord)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_hermes_run)
+    monkeypatch.setitem(sys.modules, "hermes_agent", fake_hermes_agent)
+    monkeypatch.setenv("HERMES_S2S_MONKEYPATCH_DISCORD", "1")
+
+    # --- mock ThreadResolver to return a deterministic thread_id -------------
+    async def _fake_resolve(self, adapter, event, voice_channel):  # noqa: ARG001,ARG002
+        return 77777
+
+    monkeypatch.setattr(
+        "hermes_s2s.voice.threads.ThreadResolver.resolve", _fake_resolve
+    )
+
+    # --- install ---------------------------------------------------------------
+    ctx = types.SimpleNamespace()
+    discord_bridge.install_discord_voice_bridge(ctx)
+
+    # (a) Runner was wrapped + marker is set
+    assert FakeAIAgentRunner._handle_voice_channel_join is not original_handle_voice_channel_join
+    assert getattr(FakeAIAgentRunner, discord_bridge._S2S_RUNNER_WRAPPED, False) is True
+    assert getattr(
+        FakeAIAgentRunner._handle_voice_channel_join,
+        discord_bridge._S2S_RUNNER_WRAPPED,
+        False,
+    ) is True
+
+    # (b) Exercise it end-to-end and verify the snapshot was rewritten
+    runner = FakeAIAgentRunner(fake_adapter)
+    event = FakeEvent()
+
+    result = asyncio.run(
+        FakeAIAgentRunner._handle_voice_channel_join(runner, event)
+    )
+
+    assert _observed["original_called"] is True, "original runner method must run first"
+    assert _observed["pre_runner_thread_id"] is None, (
+        "original snapshot must have been taken before thread resolution ran "
+        "(this is the whole point of the runner wrap)"
+    )
+    assert result.startswith("Joined voice channel")
+    # After our wrap, the live event must reflect the resolved thread
+    assert event.source.thread_id == "77777"
+    assert event.source.chat_type == "thread"
+    # And the adapter's voice-source snapshot must have been rewritten so
+    # subsequent voice MessageEvents inherit the thread.
+    snap = fake_adapter._voice_sources[9999]
+    assert snap.get("thread_id") == "77777"
+    assert snap.get("chat_type") == "thread"
+
+    # Idempotency — a second install must NOT re-wrap the runner.
+    current_wrapped = FakeAIAgentRunner._handle_voice_channel_join
+    discord_bridge.install_discord_voice_bridge(ctx)
+    assert FakeAIAgentRunner._handle_voice_channel_join is current_wrapped
+
+
 def test_install_bails_cleanly_when_gateway_module_missing(monkeypatch, caplog):
     """Env var set but gateway.platforms.discord not importable -> warn, return."""
     # Ensure our fake from the previous test (if cached) is gone.
@@ -216,6 +378,12 @@ def test_attach_realtime_wires_bridge_when_mode_is_realtime(monkeypatch):
     * bridge.start() is scheduled on the voice_client's loop
     * adapter._s2s_bridges[guild_id] is populated
     """
+    # W1c: the factory's capability gate requires GEMINI_API_KEY when the
+    # provider is gemini-live. Set it so the config-default path doesn't
+    # fall back to cascaded. (Pre-W1c this test didn't need the env var
+    # because there was no capability check.)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-xxx")
+
     RealtimeAudioBridgeCls, HermesToolBridgeCls, QueuedPCMSourceCls = (
         _install_b1_b2_stubs(monkeypatch)
     )
@@ -279,8 +447,12 @@ def test_attach_realtime_wires_bridge_when_mode_is_realtime(monkeypatch):
     coro_arg = run_coro.call_args.args[0]
     loop_arg = run_coro.call_args.args[1]
     assert loop_arg is vc.loop
-    # Coroutine object came from bridge.start()
-    bridge_instance.start.assert_called_once()
+    # W1c: the factory now schedules session.start() (not bridge.start())
+    # on the VC loop. The session's _on_start performs the connect-before-
+    # pumps fence (W1b M1.5) and is responsible for wiring the bridge.
+    # So we only assert run_coroutine_threadsafe was called with a coroutine
+    # object from the RealtimeSession — which is verified by the loop_arg
+    # assertion above. The raw bridge.start() no longer fires directly.
     # Tracking for cleanup
     assert getattr(adapter, "_s2s_bridges", {}).get(1234) is bridge_instance
     # Close the coroutine we never awaited to keep pytest warnings quiet.

@@ -2,6 +2,67 @@
 
 > A standalone Hermes plugin that gives Discord, Telegram, and CLI voice mode the **full S2S backend matrix**: native realtime models (Gemini Live, GPT-4o Realtime), cloud cascaded pipelines, hybrid local+cloud, and fully-local pipelines (your own Moonshine+vLLM+Kokoro server). Mix and match per-stage. Configurable per-call.
 
+## What's new in 0.4.0
+
+**Voice-mode rearchitecture** (see `docs/plans/wave-0.4.0-rearchitecture.md`,
+ADRs 0010–0014, and research-13/14/15):
+
+- **Four modes, one switch.** `s2s.mode ∈ {cascaded, pipeline, realtime, s2s-server}`.
+  The legacy boolean `s2s.mode: duplex` is gone — the 0.4.0 config auto-translates on
+  first load and a one-shot migrator (`python -m hermes_s2s.migrate_0_4`) writes the
+  new shape to disk. See the migration note below.
+- **Plugin-owned `/s2s` slash command.** In Discord, type
+  `/s2s mode:<choice>` to switch the voice backend for this session
+  without editing YAML (`mode:cascaded`, `mode:pipeline`,
+  `mode:realtime`, `mode:s2s-server`). The change is session-scoped —
+  it doesn't rewrite your `~/.hermes/config.yaml`. Global defaults
+  still come from config.
+- **Thread mirroring.** When `/voice join` or `/s2s` is invoked **from a thread**,
+  the bot reuses that thread for transcripts. Invoked from a **plain channel**,
+  the bot auto-creates a public thread (auto-archive: 1 day) and mirrors all
+  STT transcripts + assistant replies into it. Forum parents fall back to
+  the parent channel. Thread-name and starter-message templates are
+  configurable under `s2s.voice.thread_name_template` /
+  `s2s.voice.thread_starter_message`.
+- **Voice meta-commands** — say the wakeword, then a full natural
+  phrase. The built-in grammar (see `hermes_s2s/voice/meta.py`)
+  recognises:
+  - `"hey aria, start a new session"` (or `"begin"` / `"open a new chat"`)
+  - `"hey aria, compress the context"` (or `"condense"` / `"summarize"`)
+  - `"hey aria, title this session as <title>"` (or `"name this chat to …"`)
+  - `"hey aria, branch off here"` (or `"fork from this point"`)
+  - `"hey aria, clear the context"` (or `"reset the session"`)
+  - `"hey aria, stop"` (or `"cancel"` / `"hush"` / `"quiet"`) — interrupts TTS
+  These match on full phrases, not bare verbs — `"hey aria new"` won't
+  match; you need `"hey aria, start a new session"`. Six verbs in
+  0.4.0; `resume` is deferred to 0.4.1. The wakeword defaults to
+  `"hey aria"` and is configurable under `s2s.voice.wakeword`.
+- **Voice persona overlay + prompt-injection defense.** Voice mode now
+  layers a short persona prompt over Hermes's base system prompt, with
+  a hard-coded prompt-injection-defense block that refuses overrides of
+  the "ignore previous instructions" / "you are now …" family from
+  within a spoken transcript. See ADR-0013.
+- **2-bucket tool-export policy (provisional for 0.4.0).** Voice tools
+  are split into always-on (`hermes_meta_*` + a small allow-list:
+  `web_search`, `vision_analyze`, `text_to_speech`, `clarify`) and
+  deny-listed (everything else, fail-closed), enforced by a CI fence
+  that imports the canonical core-tools list at test time. The third
+  `ask` bucket with a synchronous voice-confirm flow ("ARIA wants to
+  read FILENAME — say yes or no") is deferred to 0.4.1. See
+  ADR-0014 "0.4.0 implementation note".
+
+**Migration path.** The old `s2s.mode: duplex` boolean is silently
+auto-translated to `s2s.mode: realtime` on first load (sentinel guard
+prevents re-translation). For a clean one-shot rewrite run:
+
+```bash
+python -m hermes_s2s.migrate_0_4            # rewrite in place (creates .bak)
+python -m hermes_s2s.migrate_0_4 --dry-run  # show the diff, write nothing
+python -m hermes_s2s.migrate_0_4 --rollback # restore from .bak
+```
+
+See ADR-0014 for the full translation table.
+
 ## What this is
 
 Hermes ships built-in voice mode with a fixed cascaded STT → LLM → TTS pipeline and a small set of providers. `hermes-s2s` extends that with:
@@ -119,7 +180,22 @@ Three top-level modes, six provider categories:
 
 ## Status
 
-**0.3.2 (current):** plug-and-play install + `hermes s2s doctor` diagnostic + backend filler audio. `hermes s2s setup --profile realtime-gemini` writes the full realtime config + monkey-patch flag in one shot; `hermes s2s doctor` runs a readiness check over config, Python deps, system deps, API keys, and an optional backend-WS probe. Backend filler audio (`send_filler_audio`) now lands for both Gemini Live and OpenAI Realtime so slow tool calls no longer produce dead air. See [docs/INSTALL.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/INSTALL.md) for the install profile matrix and [docs/HOWTO-VOICE-MODE.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/HOWTO-VOICE-MODE.md#diagnosing-problems-with-hermes-s2s-doctor) for the doctor walkthrough.
+**0.4.0 (current):** voice-mode rearchitecture. Four explicit modes
+(`cascaded` / `pipeline` / `realtime` / `s2s-server`), a plugin-owned
+`/s2s mode:<choice>` slash command, automatic Discord-thread mirroring
+for transcripts, six wakeword-prefixed voice meta-commands
+(`"hey aria, start a new session"` / `"… compress the context"` /
+`"… title this session as X"` / `"… branch off here"` / `"… stop"` /
+`"… clear the context"`), a voice persona overlay with
+prompt-injection defense, and a fail-closed 2-bucket tool-export
+policy enforced by CI (the 3-bucket posture with a synchronous
+voice-confirm flow is deferred to 0.4.1 — see ADR-0014 "0.4.0
+implementation note"). Legacy `s2s.mode: duplex` auto-translates to
+`s2s.mode: realtime` on first load; see the 0.4.0 section above for
+the full migration path. Design: ADRs 0010–0014 and
+`docs/design-history/research/13-*`, `14-*`, `15-*`.
+
+**0.3.2:** plug-and-play install + `hermes s2s doctor` diagnostic + backend filler audio. `hermes s2s setup --profile realtime-gemini` writes the full realtime config + monkey-patch flag in one shot; `hermes s2s doctor` runs a readiness check over config, Python deps, system deps, API keys, and an optional backend-WS probe. Backend filler audio (`send_filler_audio`) now lands for both Gemini Live and OpenAI Realtime so slow tool calls no longer produce dead air. See [docs/INSTALL.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/INSTALL.md) for the install profile matrix and [docs/HOWTO-VOICE-MODE.md](https://github.com/baladithyab/hermes-s2s/blob/main/docs/HOWTO-VOICE-MODE.md#diagnosing-problems-with-hermes-s2s-doctor) for the doctor walkthrough.
 
 **0.3.1:** realtime audio actually flows through Discord. With `HERMES_S2S_MONKEYPATCH_DISCORD=1` + `s2s.mode: realtime`, `/voice join` bridges a Discord VC end-to-end through Gemini Live or OpenAI Realtime — incoming 48 kHz stereo Opus is decoded, resampled, and streamed to the backend; responses come back as 20 ms / 3 840-byte frames into `discord.AudioSource`. Tool calls round-trip through Hermes's dispatcher with 5 s soft / 30 s hard timeouts. See [docs/HOWTO-REALTIME-DISCORD.md](docs/HOWTO-REALTIME-DISCORD.md) to set it up and [scripts/smoke_realtime.py](scripts/smoke_realtime.py) to validate your API keys standalone.
 
@@ -135,10 +211,13 @@ Three top-level modes, six provider categories:
 - [x] **Tool-call bridging with timeouts** (0.3.1 — see ADR-0008)
 - [x] **Plug-and-play install + `hermes s2s doctor`** (0.3.2 — see ADR-0009)
 - [x] **Per-backend filler-audio implementation** (0.3.2)
-- [ ] Multi-user VC mixing (0.4.0)
-- [ ] Filler-audio cancellation when the tool result arrives early (0.4.0)
-- [ ] Daemon mode to eliminate per-call model-load cost (0.3.x)
-- [ ] Telegram realtime duplex (0.4.0)
+- [x] **Four explicit modes + `/s2s mode:<choice>` slash + thread mirroring + meta-commands + persona overlay** (0.4.0 — ADRs 0010–0014)
+- [ ] Multi-user VC mixing (0.4.1)
+- [ ] Filler-audio cancellation when the tool result arrives early (0.4.1)
+- [ ] Voice meta-command `resume` verb (0.4.1)
+- [ ] 3-bucket tool-export (`ask` bucket with synchronous voice-confirm flow) (0.4.1 — see ADR-0014 "0.4.0 implementation note")
+- [ ] Daemon mode to eliminate per-call model-load cost (0.4.x)
+- [ ] Telegram realtime duplex (0.5.0)
 - [ ] PyPI publish
 
 > **Known issues in 0.3.2:**

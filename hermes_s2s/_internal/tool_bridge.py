@@ -29,6 +29,151 @@ logger = logging.getLogger(__name__)
 DispatchFn = Callable[[str, dict], Any]  # may be sync or async
 
 
+# ---------------------------------------------------------------------------
+# Tool-export policy (WAVE 4b M4.4; ADR-0014 §3).
+#
+# PROVISIONAL 0.4.0 POSTURE — 2 BUCKETS (fail-closed):
+# Per Phase-8 final security review P0-2, the synchronous voice-confirm flow
+# that ASK-bucket was meant to guard ("ARIA wants to read FILENAME — say yes
+# or no") is not implemented. Shipping an ASK bucket in this state would
+# silently expose user-data reads without the promised confirmation prompt.
+# For 0.4.0 we fail-closed: ALL ASK candidates are promoted into DENY, and
+# the ASK set is kept empty as a placeholder for 0.4.1 (which will land the
+# voice-confirm flow and repopulate ASK).
+#
+# Unknown tools are also hard-dropped from the manifest (fail-closed).
+# The CI fence ``tests/test_tool_export.py::test_every_core_tool_classified``
+# asserts that every known core tool appears in exactly one bucket.
+# ---------------------------------------------------------------------------
+
+#: Auto-allow, no prompt. Tools with no user-data, no system mutation,
+#: no cost amplification.
+DEFAULT_EXPOSED: set[str] = {
+    "web_search",
+    "vision_analyze",
+    "text_to_speech",
+    "clarify",
+}
+
+#: PROVISIONALLY EMPTY for 0.4.0. TODO(0.4.1): Implement the synchronous
+#: voice yes/no confirm flow ("ARIA wants to read FILENAME — say yes or no";
+#: 5s window; default-deny on timeout) and repopulate this bucket with
+#: ``read_file``, ``search_files``, ``session_search``, ``memory``,
+#: ``web_extract``, ``browser_navigate``, ``browser_snapshot``,
+#: ``browser_vision``, ``skills_list``, ``skill_view``, ``todo``,
+#: ``ha_list_entities``, ``ha_get_state``, ``ha_list_services``,
+#: ``kanban_show``. Until then, all of these live in DENY.
+ASK: set[str] = set()
+
+#: Hard-blocked; tool is removed from the manifest entirely. The LLM cannot
+#: invoke these via voice, and the user cannot override per the persona
+#: overlay (section 4). For 0.4.0 this set absorbs the deferred ASK bucket
+#: (see above) in addition to the genuine write/privileged tools.
+DENY: set[str] = {
+    # Genuine write / privileged / code-exec tools.
+    "terminal",
+    "process",
+    "execute_code",
+    "patch",
+    "write_file",
+    "computer_use",
+    "delegate_task",
+    "cronjob",
+    "ha_call_service",
+    "kanban_create",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_link",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_console",
+    "browser_get_images",
+    "browser_back",     # write op — reintroduced per P0-1
+    "browser_cdp",      # privileged
+    "browser_dialog",   # modal interaction
+    "send_message",
+    "skill_manage",
+    "image_generate",
+    # 0.4.0 provisional: deferred ASK entries (see ASK docstring above).
+    "read_file",
+    "search_files",
+    "session_search",
+    "memory",
+    "web_extract",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_vision",
+    "skills_list",
+    "skill_view",
+    "todo",
+    "ha_list_entities",
+    "ha_get_state",
+    "ha_list_services",
+    "kanban_show",
+}
+
+
+def build_tool_manifest(
+    enabled_tools: list[dict], mode: str = "realtime"
+) -> list[dict]:
+    """Filter a Hermes tool list by the voice-export policy.
+
+    Returns a new list containing only tools in ``DEFAULT_EXPOSED``
+    (0.4.0 provisional — see module docstring; ASK bucket will rejoin
+    in 0.4.1 once the voice-confirm flow lands), plus the always-exposed
+    ``hermes_meta_*`` tools appended at the end. Tools in ``DENY`` are
+    hard-removed. Unknown/unclassified tools are conservatively dropped
+    (fail-closed).
+
+    Args:
+        enabled_tools: The Hermes-side list of tool schemas. Each entry
+            must have a ``name`` key.
+        mode: Reserved for future per-mode policy variants
+            (``realtime``/``cascaded``). Currently unused; the same
+            3-bucket policy applies to all voice modes.
+
+    Returns:
+        A new list of tool schemas, safe to serialize into a realtime
+        backend's tool manifest.
+    """
+    # Local import to avoid a circular dependency: voice.meta_tools is a
+    # leaf module but lives in a sibling package; importing it eagerly at
+    # module load would tighten the import graph unnecessarily.
+    from hermes_s2s.voice.meta_tools import get_meta_tools
+
+    out: list[dict] = []
+    for tool in enabled_tools:
+        name = tool.get("name", "")
+        if not name:
+            continue
+        if name in DENY:
+            # Hard-drop. The LLM should not even see the tool exists.
+            continue
+        if name in DEFAULT_EXPOSED or name in ASK:
+            # ASK is empty in 0.4.0 (see module docstring); treating it
+            # as an allow-through placeholder for 0.4.1 when the voice-
+            # confirm flow lands and ASK is repopulated.
+            out.append(tool)
+            continue
+        # Unknown tool → conservative deny (fail-closed). The CI fence
+        # in tests/test_tool_export.py ensures every known core tool
+        # is classified so this path only fires for genuinely new tools
+        # that Hermes core added without updating the bucket tables.
+        logger.warning(
+            "build_tool_manifest: dropping unclassified tool %r "
+            "(add to DEFAULT_EXPOSED, ASK, or DENY in tool_bridge.py)",
+            name,
+        )
+
+    # Meta tools are always exposed, regardless of the enabled_tools input.
+    out.extend(get_meta_tools())
+    return out
+
+
 class HermesToolBridge:
     """Bridges realtime-backend tool_call events to Hermes's dispatcher.
 

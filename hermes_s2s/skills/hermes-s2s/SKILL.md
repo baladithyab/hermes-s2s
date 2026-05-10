@@ -1,7 +1,7 @@
 ---
 name: hermes-s2s
-description: "Configure and operate the hermes-s2s plugin — switch S2S modes (cascaded/realtime/s2s-server), pick per-stage providers, run smoke tests, troubleshoot Discord VC voice."
-version: 0.3.1
+description: "Configure and operate the hermes-s2s plugin — switch S2S modes (cascaded/pipeline/realtime/s2s-server), pick per-stage providers, run smoke tests, troubleshoot Discord VC voice, use /s2s slash command + voice meta-commands."
+version: 0.4.0
 author: Codeseys
 license: Apache-2.0
 metadata:
@@ -14,22 +14,56 @@ metadata:
 
 You're operating the `hermes-s2s` plugin — a Hermes extension that adds configurable speech-to-speech to voice mode. It lives in `~/.hermes/plugins/hermes-s2s/` (or wherever the user installed it).
 
+## What changed in 0.4.0
+
+- **Four modes** (was three): `cascaded | pipeline | realtime | s2s-server`.
+  The pre-0.4 `s2s.mode: duplex` boolean is gone — the loader
+  auto-translates to `realtime` on first load; a one-shot migrator
+  (`python -m hermes_s2s.migrate_0_4`) writes the new shape.
+- **Plugin-owned `/s2s` slash command** in Discord. Use this to pick
+  modes / check readiness / run smoke TTS from chat.
+- **Thread mirroring** in Discord: join from a thread → reuses it;
+  join from a channel → auto-creates a public thread (auto-archive
+  1 day) and mirrors transcripts.
+- **Voice meta-commands** — say the wakeword (default `hey aria`)
+  followed by a verb phrase for one of six verbs:
+  `new | compress | title | branch | clear | stop_speaking`
+  (e.g. `"hey aria, start a new session"`,
+  `"hey aria, compress the context"`). Dispatched through the
+  gateway's MetaDispatcher before the LLM sees the transcript.
+- **Voice persona overlay + prompt-injection defense** — voice
+  replies get a persona overlay and a hard-coded defense block that
+  refuses "ignore previous instructions"-style payloads within a
+  spoken transcript. See ADR-0013.
+- **2-bucket tool-export policy** (provisional for 0.4.0): always-on
+  default-exposed (`hermes_meta_*` + `web_search`, `vision_analyze`,
+  `text_to_speech`, `clarify`) and deny-listed (everything else,
+  fail-closed). Enforced by a CI fence. The third `ask` bucket
+  (synchronous voice-confirm flow) is deferred to 0.4.1 — see
+  ADR-0014 "0.4.0 implementation note".
+
+Pointer to design: ADRs 0010–0014 under `docs/adrs/`, research notes
+under `docs/design-history/research/13-*`, `14-*`, `15-*`, and the
+full wave plan at `docs/plans/wave-0.4.0-rearchitecture.md`.
+
 ## When to load this skill
 
 - User asks "what voice mode am I in" / "switch to realtime" / "use my local TTS".
 - Voice replies are silent or wrong — debugging path.
 - Setting up Discord VC voice for the first time with cloud or local backends.
 - User asks about Gemini Live, GPT-4o Realtime, Moonshine, Kokoro, or `streaming-speech-to-speech` server integration in the context of Hermes voice.
+- User asks about `/s2s`, voice meta-commands, or thread mirroring.
 
-## Three modes, one switch
+## Four modes, one switch (0.4.0+)
 
 ```
 s2s.mode: cascaded     # STT → Hermes LLM → TTS  (default, max flexibility)
+s2s.mode: pipeline     # Hermes's built-in tightly-coupled STT→LLM→TTS
 s2s.mode: realtime     # native duplex (Gemini Live, GPT-4o Realtime)
 s2s.mode: s2s-server   # external pipeline server (full v6 stack)
 ```
 
-Set globally in `~/.hermes/config.yaml` under the `s2s:` key. Override per session with `/s2s mode <name>` or `hermes s2s mode <name>`.
+Set globally in `~/.hermes/config.yaml` under the `s2s:` key. Override per session with `/s2s mode:<choice>` (Discord) or `hermes s2s mode <name>` (CLI).
 
 ## Common config recipes
 
@@ -89,13 +123,17 @@ Requires running https://github.com/codeseys/streaming-speech-to-speech (or comp
 
 ## Slash commands
 
+0.4.0 ships a deliberately small `/s2s` surface — exactly one
+subcommand with one required choice:
+
 ```
-/s2s                  # show config + readiness
-/s2s status           # same
-/s2s mode realtime    # switch mode for this session only
-/s2s test             # run a TTS smoke test, write to ~/.hermes/voice-memos/
-/s2s test "hello"     # specific text
+/s2s mode:<choice>    # <choice> ∈ {cascaded, pipeline, realtime, s2s-server}
 ```
+
+Session-scoped (in-memory for this guild+channel); does NOT write
+`config.yaml`. Status / readiness and TTS smoke-test commands are
+**not** on the 0.4.0 `/s2s` surface — use `hermes s2s doctor` and
+`hermes s2s test --text "..."` from the CLI.
 
 ## CLI commands
 

@@ -86,6 +86,48 @@ Explicitly **not** placed in:
 - `/resume` gap in voice is deliberate UX — documented in user-facing help as "use the text client to resume a specific session by name."
 - Serial-by-default costs some latency on multi-tool turns; reconsider if Gemini `NON_BLOCKING` adoption (ADR-0008 §2) makes parallel narration natural.
 
+## 0.4.0 implementation note
+
+**Ship status (2026-05-10):** sections 1, 2, 4, 5, 6, 7 ship as designed
+in 0.4.0. Section 3 (the 3-bucket policy) ships **provisionally with 2
+buckets** — the `ask` bucket is deferred to 0.4.1.
+
+**Why the deferral.** The Phase-8 final security review (P0-2) caught
+that the synchronous voice yes/no confirm flow the `ask` bucket was
+meant to guard (`"ARIA wants to read FILENAME — say yes or no"`, 5-second
+window, default-deny on timeout) is not implemented in the 0.4.0
+`meta_dispatcher`. Shipping an `ask` bucket in that state would
+silently expose the user-data-read tools (`read_file`, `search_files`,
+`session_search`, `memory`, `web_extract`, `browser_navigate`,
+`browser_snapshot`, `browser_vision`, `skills_list`, `skill_view`,
+`todo`, `ha_list_entities`, `ha_get_state`, `ha_list_services`,
+`kanban_show`) with **no** confirmation gate — strictly worse than
+the pre-0.4.0 text-only status quo.
+
+**0.4.0 posture.** The `ask` candidates listed above are all promoted
+into `deny` for 0.4.0. The `ASK` set in `hermes_s2s/_internal/tool_bridge.py`
+is an empty placeholder with a `TODO(0.4.1)` marker. `build_tool_manifest`
+still consults both buckets so the code path stays warm for 0.4.1. A
+CI-fence test (`tests/test_tool_export.py::test_ask_bucket_empty_for_0_4_0`)
+asserts the empty-ASK invariant until 0.4.1 flips it.
+
+**0.4.1 plan.** Land the synchronous voice-confirm flow in
+`meta_dispatcher`:
+
+1. On a voice tool call whose name is in `ASK`, intercept before
+   dispatch; send a short TTS prompt ("ARIA wants to read
+   `main.py` — say yes or no"); open a 5-second confirm window.
+2. Accept `yes`/`yeah`/`go ahead` variants; reject on anything else
+   or on timeout; default-deny.
+3. Only on explicit `yes` does the bridge dispatch the tool.
+4. Repopulate `ASK` with the 15 deferred entries; update this ADR
+   section to mark the 3-bucket policy as shipped; delete the
+   `test_ask_bucket_empty_for_0_4_0` fence.
+
+This is a conservative fail-closed posture — better to under-expose
+than silently expose user data. Voice-mode operators who need these
+reads in 0.4.0 can reach for the text client.
+
 ## References
 
 - research/15-voice-meta-commands-and-tool-export.md §3 (MetaCommandSink grammar), §4 (tool family), §5 (export buckets), §6 (latency), §7 (module boundaries)

@@ -1,0 +1,11 @@
+model: anthropic/claude-opus-4.7
+provider: openrouter
+s2s:
+  mode: realtime
+  realtime:
+    provider: gemini-live
+    gemini_live:
+      model: gemini-2.5-flash-native-audio-latest
+      voice: Aoede
+      language_code: en-US
+      system_prompt: 'You are ARIA.'
