@@ -273,10 +273,20 @@ def setup_argparse(subparser: argparse.ArgumentParser) -> None:
         "setup", help="Interactively configure Hermes voice mode for hermes-s2s"
     )
     p_setup.add_argument(
-        "--profile",
+        "profile_pos",
+        nargs="?",
         choices=_PROFILES,
         default=None,
-        help="Skip interactive prompt and pick a profile",
+        metavar="PROFILE",
+        help="Profile to apply (positional). Avoids collision with hermes' top-level --profile flag.",
+    )
+    p_setup.add_argument(
+        "--profile",
+        "--use-profile",
+        dest="profile",
+        choices=_PROFILES,
+        default=None,
+        help="Skip interactive prompt and pick a profile (alternative to positional)",
     )
     p_setup.add_argument(
         "--dry-run",
@@ -305,7 +315,10 @@ def setup_argparse(subparser: argparse.ArgumentParser) -> None:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    profile = args.profile
+    # Accept profile from --profile flag OR positional. Positional avoids
+    # the collision with hermes' top-level --profile flag (which gets parsed
+    # before our subcommand sees it). If both supplied, --profile wins.
+    profile = args.profile or getattr(args, "profile_pos", None)
     if profile is None:
         print("Pick a profile:")
         for i, p in enumerate(_PROFILES, 1):

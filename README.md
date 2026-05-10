@@ -27,19 +27,26 @@ Forking Hermes for this would diverge the codebase. A plugin opts users in clean
 
 ```bash
 hermes plugins install baladithyab/hermes-s2s
-cd ~/.hermes/plugins/hermes-s2s && pip install -e '.[all]'
+~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e ~/.hermes/plugins/hermes-s2s'[all]'
 hermes plugins enable hermes-s2s
-hermes s2s setup --profile realtime-gemini
+hermes s2s setup realtime-gemini
 hermes s2s doctor
 ```
 
 `hermes plugins install` clones the repo into `~/.hermes/plugins/hermes-s2s/`
-where Hermes can discover it. The `pip install -e '.[all]'` step pulls in
-Python deps (Gemini Live + OpenAI Realtime + Kokoro + Moonshine + scipy).
+where Hermes can discover it. The `pip install -e` step uses **Hermes' own
+venv python** (not your shell's pip) so the plugin's deps land where the
+`hermes` CLI can actually import them. This is the most common install
+gotcha — `pip install` from your shell may install into a different env.
 
 The doctor command tells you what's missing (API keys, system deps).
 Once it's all green, restart `hermes gateway` and `/voice join` in any
 Discord VC the bot has access to.
+
+> **Note on `hermes s2s setup`:** profile is positional (`hermes s2s setup
+> realtime-gemini`) because Hermes' top-level `--profile` flag would
+> otherwise eat our subcommand's `--profile`. The flag form
+> `hermes s2s setup --use-profile realtime-gemini` also works.
 
 ### Other profiles
 
