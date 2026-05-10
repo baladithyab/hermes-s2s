@@ -6,6 +6,33 @@
 
 **Branch:** `feat/0.4.0-rearchitecture` off `main` (post-v0.3.9).
 
+## Scope refinements (post-Phase-5 review)
+
+The original plan was sized for ~5h wall-clock and ~$15 compute. Trimmed to
+~$8-10 and ~3.5h wall-clock by deferring these items to 0.4.1 — none of
+which the user asked for explicitly:
+
+- **W2a M2.2** (Telegram inline-keyboard fallback) — DEFERRED. User is
+  Discord-primary; Telegram users keep the 0.3.x experience until 0.4.1.
+- **W2a M2.3** (CLI `/s2s` command setting next-join default) — DEFERRED.
+  CLI has no VC; less than zero P0-urgency.
+- **W4b M4.3** drops `hermes_meta_resume_session` from the 5-tool family —
+  reduced to 4 tools. The user-pick disambiguation flow is complex and
+  resume-by-voice-only is the lowest-value meta-command. Deferred to 0.4.1.
+- **W4b M4.4** (3-bucket tool-export policy) — REDUCED to 2 buckets in
+  0.4.0: `default_exposed` and `deny`. The `ask` bucket (confirmation-wrapped
+  tool calls) needs a synchronous user-prompt-during-realtime UX that's not
+  designed yet. 0.4.0 is fail-closed on the hard-deny list, conservative
+  default-exposed list. Deferred 3rd-bucket to 0.4.1.
+- **W5a** (migration) — SIMPLIFIED. Auto-translate `s2s.mode` →
+  `s2s.voice.default_mode` runs on first config-load (in `config/__init__.py`)
+  with one-time deprecation warning. NO separate `python -m hermes_s2s.migrate_0_4`
+  script, NO `--dry-run` / `--rollback` flags. Backup file written next to
+  config; user can manually `mv config.yaml.bak.0_4 config.yaml` if needed.
+- **W6a M6.3** (README badge) — DEFERRED. Feature highlights only.
+
+These changes are reflected in the wave specs below as `[REFINED]` notes.
+
 **ADRs in scope:** 0010 (sub-block unwrap, already shipped in 0.3.9 — codified
 post-hoc), 0011 (plugin-owned `/s2s` slash command), 0012 (voice thread
 co-management hooks), 0013 (four-mode VoiceSession), 0014 (voice meta + tool
