@@ -133,7 +133,7 @@ Same checklist as built-in voice (hermes-s2s does not replace Discord auth):
 
 ```bash
 pip install hermes-s2s[moonshine]
-# or pip install moonshine-onnx directly
+# or pip install useful-moonshine-onnx directly
 ```
 
 ### "Kokoro says 'package not installed'"

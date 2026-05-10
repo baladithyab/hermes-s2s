@@ -1,5 +1,5 @@
 name: hermes-s2s
-version: 0.3.2
+version: 0.3.3
 description: Configurable speech-to-speech for Hermes — realtime duplex, cascaded pipelines, local servers, fully mix-and-match.
 author: Codeseys
 license: Apache-2.0

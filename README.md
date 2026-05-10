@@ -26,11 +26,16 @@ Forking Hermes for this would diverge the codebase. A plugin opts users in clean
 ## 30-second install
 
 ```bash
-pip install 'hermes-s2s[all] @ git+https://github.com/baladithyab/hermes-s2s.git@v0.3.2'
+hermes plugins install baladithyab/hermes-s2s
+cd ~/.hermes/plugins/hermes-s2s && pip install -e '.[all]'
 hermes plugins enable hermes-s2s
 hermes s2s setup --profile realtime-gemini
 hermes s2s doctor
 ```
+
+`hermes plugins install` clones the repo into `~/.hermes/plugins/hermes-s2s/`
+where Hermes can discover it. The `pip install -e '.[all]'` step pulls in
+Python deps (Gemini Live + OpenAI Realtime + Kokoro + Moonshine + scipy).
 
 The doctor command tells you what's missing (API keys, system deps).
 Once it's all green, restart `hermes gateway` and `/voice join` in any

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-s2s"
-version = "0.3.2"
+version = "0.3.3"
 description = "Configurable speech-to-speech for Hermes Agent — realtime, cascaded, and local-pipeline backends."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Local STT
-moonshine = ["moonshine-onnx>=0.2.0"]
+moonshine = ["useful-moonshine-onnx"]
 # Local TTS
 kokoro = ["kokoro>=0.7.0"]
 # Resampling for non-16kHz inputs

@@ -12,11 +12,11 @@ def test_package_imports():
     assert hermes_s2s.__version__
 
 
-def test_version_is_0_3_2():
-    """Guard against version drift: pyproject and __init__ must match this wave's release."""
+def test_version_is_0_3_3():
+    """Sanity: bump version each release; smoke test catches forgotten bumps."""
     import hermes_s2s
-    assert hermes_s2s.__version__ == "0.3.2", (
-        f"__version__ is {hermes_s2s.__version__!r}; expected '0.3.2'. "
+    assert hermes_s2s.__version__ == "0.3.3", (
+        f"__version__ is {hermes_s2s.__version__!r}; expected '0.3.3'. "
         "Update hermes_s2s/__init__.py and pyproject.toml together."
     )
 

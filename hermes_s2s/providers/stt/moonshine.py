@@ -1,7 +1,7 @@
 """Moonshine STT provider (UsefulSensors, MIT, local).
 
 Ported from work originally on the Hermes feat/aria-voice branch.
-Tries `moonshine-onnx` first (no torch dep), falls back to `transformers`
+Tries `useful-moonshine-onnx` first (no torch dep), falls back to `transformers`
 with `MoonshineForConditionalGeneration`. Caches the loaded model
 module-globally per `model_name` so subsequent calls reuse weights.
 """
@@ -36,7 +36,7 @@ def _load_moonshine_model(model_name: str):
         return (model, processor), "transformers"
     except ImportError as exc:
         raise ImportError(
-            "Moonshine requires either moonshine-onnx or transformers. "
+            "Moonshine requires either useful-moonshine-onnx or transformers. "
             "Install via: pip install hermes-s2s[moonshine]"
         ) from exc
 
