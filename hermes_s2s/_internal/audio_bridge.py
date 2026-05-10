@@ -23,7 +23,7 @@ import asyncio
 import logging
 import queue
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_s2s.audio.resample import resample_pcm
 
@@ -350,6 +350,13 @@ class RealtimeAudioBridge:
         self._tool_seq_cond: Optional[asyncio.Condition] = None
         self._tool_seq_next_dispatch = 0
         self._tool_seq_next_inject = 0
+        # W3b M3.3: optional transcript sink. Set externally by
+        # discord_bridge._attach_realtime_to_voice_client when a thread
+        # + TranscriptMirror are available. Signature:
+        #   sink(*, role: str, text: str, final: bool) -> None
+        # Synchronous — the sink is expected to schedule its own async
+        # work (see voice.transcript.TranscriptMirror.schedule_send).
+        self._transcript_sink: Optional[Callable[..., None]] = None
 
     # ---------------- public API ----------------
 
@@ -613,8 +620,31 @@ class RealtimeAudioBridge:
             task.add_done_callback(self._tool_tasks.discard)
         elif etype == "error":
             logger.warning("backend error event: %r", payload)
-        # transcript_partial / transcript_final / session_resumed: ignored
-        # for 0.3.1. Future: forward to Hermes session log.
+        # W3b M3.3 — route realtime transcripts to the optional sink
+        # installed by discord_bridge when a thread is available. The
+        # backend emits ONE event type for both roles, distinguished by
+        # payload['role']:
+        #   RealtimeEvent(type="transcript_partial",
+        #                 payload={"text": ..., "role": "user"|"assistant"})
+        #   RealtimeEvent(type="transcript_final",
+        #                 payload={"role": "user"|"assistant"})    # no text
+        # Do NOT access event.text / event.final as attributes — those
+        # are not attributes on RealtimeEvent; they live inside payload.
+        elif etype == "transcript_partial" and self._transcript_sink:
+            role = payload.get("role", "assistant")
+            text = payload.get("text", "")
+            if text:
+                try:
+                    self._transcript_sink(role=role, text=text, final=False)
+                except Exception:  # noqa: BLE001 — sink must not break pump
+                    logger.exception("transcript sink raised on partial")
+        elif etype == "transcript_final" and self._transcript_sink:
+            role = payload.get("role", "assistant")
+            try:
+                self._transcript_sink(role=role, text="", final=True)
+            except Exception:  # noqa: BLE001 — sink must not break pump
+                logger.exception("transcript sink raised on final")
+        # session_resumed: still ignored for 0.4.0.
 
     async def _run_and_inject_tool(
         self, call_id: str, name: str, args: dict
