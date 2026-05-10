@@ -18,6 +18,7 @@ from .capabilities import (
     check_requirements,
     requirements_for,
 )
+from .factory import VoiceSessionFactory
 from .modes import ModeRouter, ModeSpec, VoiceMode
 from .sessions import (
     AsyncExitStackBaseSession,
@@ -39,4 +40,5 @@ __all__ = [
     "CapabilityError",
     "check_requirements",
     "requirements_for",
+    "VoiceSessionFactory",
 ]

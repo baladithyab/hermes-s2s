@@ -157,16 +157,26 @@ class ModeRouter:
         guild_id: int | str | None = None,
         channel_id: int | str | None = None,
     ) -> ModeSpec:
-        """Pick a mode and wrap it in a :class:`ModeSpec`."""
-        raw = self._resolve_raw(
+        """Pick a mode and wrap it in a :class:`ModeSpec`.
+
+        The returned ``spec.options`` dict carries a boolean ``_explicit``
+        flag that is True iff the resolved mode came from a source the
+        operator picked *directly* (slash hint or env var), as opposed
+        to a config default. The factory (W1c M1.8) consults this flag
+        to decide between fail-closed (explicit) and warn-and-fallback
+        (non-explicit) behavior when capability gating fails.
+        """
+        raw, explicit = self._resolve_with_source(
             mode_hint=mode_hint, guild_id=guild_id, channel_id=channel_id
         )
         mode = VoiceMode.normalize(raw)
         voice_cfg = self._voice_cfg()
+        options = dict(voice_cfg.get("options") or {})
+        options["_explicit"] = explicit
         return ModeSpec(
             mode=mode,
             provider=voice_cfg.get("provider"),
-            options=dict(voice_cfg.get("options") or {}),
+            options=options,
         )
 
     # --- precedence chain ----------------------------------------------
@@ -178,18 +188,40 @@ class ModeRouter:
         guild_id: int | str | None,
         channel_id: int | str | None,
     ) -> str:
+        raw, _explicit = self._resolve_with_source(
+            mode_hint=mode_hint, guild_id=guild_id, channel_id=channel_id
+        )
+        return raw
+
+    def _resolve_with_source(
+        self,
+        *,
+        mode_hint: str | VoiceMode | None,
+        guild_id: int | str | None,
+        channel_id: int | str | None,
+    ) -> tuple[str, bool]:
+        """Walk the precedence chain and return ``(raw_mode, explicit)``.
+
+        ``explicit`` is True iff the winning level was the slash hint
+        (level 1) or the env var (level 2) — those are the two places
+        where the operator typed the mode directly. Channel/guild
+        overrides and the config default are all configuration-sourced
+        (not "explicit request") and therefore take the warn+fallback
+        path in the factory.
+        """
         # Each level returns None to signal "skip me"; first non-None wins.
-        for level in (
-            lambda: self._from_hint(mode_hint),
-            self._from_env,
-            lambda: self._from_channel(channel_id),
-            lambda: self._from_guild(guild_id),
-            self._from_default,
-        ):
+        levels: list[tuple[bool, Any]] = [
+            (True, lambda: self._from_hint(mode_hint)),
+            (True, self._from_env),
+            (False, lambda: self._from_channel(channel_id)),
+            (False, lambda: self._from_guild(guild_id)),
+            (False, self._from_default),
+        ]
+        for explicit, level in levels:
             result = level()
             if result is not None:
-                return result
-        return VoiceMode.CASCADED.value
+                return result, explicit
+        return VoiceMode.CASCADED.value, False
 
     def _from_hint(self, mode_hint: str | VoiceMode | None) -> str | None:
         if mode_hint is None:

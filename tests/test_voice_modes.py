@@ -602,3 +602,347 @@ def test_session_exit_stack_is_shared_resource():
     """Subclasses access the same AsyncExitStack used by stop()."""
     s = _DummySession()
     assert isinstance(s._exit_stack, contextlib.AsyncExitStack)
+
+
+# ---------------------------------------------------------------------------
+# WAVE 1c — factory + capability tests
+# ---------------------------------------------------------------------------
+
+
+import types
+from unittest.mock import AsyncMock, MagicMock
+
+from hermes_s2s.voice import (
+    CapabilityError,
+    ModeRequirements,
+    VoiceSessionFactory,
+    check_requirements,
+    requirements_for,
+)
+from hermes_s2s.voice.sessions_cascaded import CascadedSession
+from hermes_s2s.voice.sessions_realtime import RealtimeSession
+
+
+def _mk_vc(guild_id: int = 111, channel_id: int = 222):
+    """Minimal VoiceClient-shaped mock with .guild.id and .channel.id."""
+    vc = MagicMock()
+    vc.guild = MagicMock()
+    vc.guild.id = guild_id
+    vc.channel = MagicMock()
+    vc.channel.id = channel_id
+    return vc
+
+
+def _mk_adapter():
+    """Minimal adapter that starts without a _s2s_sessions dict."""
+    adapter = types.SimpleNamespace()
+    return adapter
+
+
+# --- capability gate --------------------------------------------------------
+
+
+def test_requirements_for_cascaded_is_empty():
+    reqs = requirements_for(VoiceMode.CASCADED, ModeSpec(VoiceMode.CASCADED))
+    assert isinstance(reqs, ModeRequirements)
+    assert reqs.env_vars == []
+    assert reqs.python_packages == []
+
+
+def test_requirements_for_realtime_gemini_requires_gemini_key():
+    spec = ModeSpec(VoiceMode.REALTIME, provider="gemini-live")
+    reqs = requirements_for(VoiceMode.REALTIME, spec)
+    assert "GEMINI_API_KEY" in reqs.env_vars
+    assert "OPENAI_API_KEY" not in reqs.env_vars
+
+
+def test_requirements_for_realtime_openai_requires_openai_key():
+    spec = ModeSpec(VoiceMode.REALTIME, provider="gpt-realtime")
+    reqs = requirements_for(VoiceMode.REALTIME, spec)
+    assert "OPENAI_API_KEY" in reqs.env_vars
+    assert "GEMINI_API_KEY" not in reqs.env_vars
+
+
+def test_check_requirements_cascaded_always_ok():
+    spec = ModeSpec(VoiceMode.CASCADED)
+    result = check_requirements(VoiceMode.CASCADED, spec, env={})
+    assert result["ok"] is True
+    assert result["missing"] == []
+
+
+def test_check_requirements_realtime_misses_env_var():
+    spec = ModeSpec(VoiceMode.REALTIME, provider="gemini-live")
+    result = check_requirements(VoiceMode.REALTIME, spec, env={})
+    assert result["ok"] is False
+    assert "env:GEMINI_API_KEY" in result["missing"]
+
+
+def test_check_requirements_realtime_satisfied_when_env_set():
+    spec = ModeSpec(VoiceMode.REALTIME, provider="gemini-live")
+    # Include websockets as found since it's installed in this env.
+    result = check_requirements(
+        VoiceMode.REALTIME, spec, env={"GEMINI_API_KEY": "xyz"}
+    )
+    # websockets IS installed in the dev env; if not, test environment
+    # itself is broken — accept either answer here.
+    if result["ok"]:
+        assert result["missing"] == []
+    else:
+        # The only acceptable miss is pip:websockets (env was satisfied).
+        assert all(m.startswith("pip:") for m in result["missing"])
+
+
+def test_capability_error_user_message_includes_mode_and_missing():
+    err = CapabilityError(["env:GEMINI_API_KEY"], VoiceMode.REALTIME)
+    msg = err.user_message()
+    assert "realtime" in msg
+    assert "GEMINI_API_KEY" in msg
+
+
+# --- factory construction ---------------------------------------------------
+
+
+def test_factory_builds_cascaded_session_with_no_capability_requirements():
+    """Cascaded is the zero-dep baseline — factory returns CascadedSession."""
+    factory = VoiceSessionFactory(registry=None)
+    spec = ModeSpec(VoiceMode.CASCADED, options={"_explicit": True})
+    vc = _mk_vc()
+    adapter = _mk_adapter()
+    session = factory.build(spec, vc, adapter)
+    assert isinstance(session, CascadedSession)
+    # Registration keyed per-channel.
+    key = (vc.guild.id, vc.channel.id)
+    assert adapter._s2s_sessions[key] is session
+
+
+def test_factory_idempotent(monkeypatch):
+    """Calling factory.build() twice on the same adapter registers under
+    the same key; the second call replaces but doesn't double-wrap."""
+    factory = VoiceSessionFactory(registry=None)
+    spec = ModeSpec(VoiceMode.CASCADED, options={"_explicit": True})
+    vc = _mk_vc()
+    adapter = _mk_adapter()
+
+    s1 = factory.build(spec, vc, adapter)
+    s2 = factory.build(spec, vc, adapter)
+
+    key = (vc.guild.id, vc.channel.id)
+    # Only one entry per (guild, channel) — the dict slot is replaced.
+    assert adapter._s2s_sessions[key] is s2
+    assert s1 is not s2
+
+    # Also: the discord_bridge _BRIDGE_WRAPPED_MARKER idempotency guard
+    # must still prevent double-wrap if the install runs twice. Verify
+    # by invoking _install_via_monkey_patch with a stub gateway module.
+    import sys
+
+    from hermes_s2s._internal import discord_bridge
+
+    class _StubAdapterCls:
+        async def join_voice_channel(self, channel):  # pragma: no cover
+            return None
+
+        async def leave_voice_channel(self, *a, **k):  # pragma: no cover
+            return None
+
+    stub_mod = types.ModuleType("gateway.platforms.discord")
+    stub_mod.DiscordAdapter = _StubAdapterCls
+    monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    monkeypatch.setitem(
+        sys.modules, "gateway.platforms", types.ModuleType("gateway.platforms")
+    )
+    monkeypatch.setitem(sys.modules, "gateway.platforms.discord", stub_mod)
+
+    discord_bridge._install_via_monkey_patch(ctx=None)
+    first_wrap = _StubAdapterCls.join_voice_channel
+    assert getattr(first_wrap, discord_bridge._BRIDGE_WRAPPED_MARKER, False) is True
+
+    # Second call should be a no-op — the marker short-circuits.
+    discord_bridge._install_via_monkey_patch(ctx=None)
+    assert _StubAdapterCls.join_voice_channel is first_wrap
+
+
+def test_factory_falls_back_to_cascaded_when_config_default_unavailable():
+    """Config default is realtime + no GEMINI_API_KEY → CascadedSession, no raise."""
+    factory = VoiceSessionFactory(registry=None)
+    # _explicit=False (i.e. came from config default) → warn+fallback.
+    spec = ModeSpec(
+        VoiceMode.REALTIME,
+        provider="gemini-live",
+        options={"_explicit": False},
+    )
+    vc = _mk_vc()
+    adapter = _mk_adapter()
+
+    import os
+
+    prior = os.environ.pop("GEMINI_API_KEY", None)
+    try:
+        session = factory.build(spec, vc, adapter)
+    finally:
+        if prior is not None:
+            os.environ["GEMINI_API_KEY"] = prior
+    # Must land on cascaded (not raise).
+    assert isinstance(session, CascadedSession)
+
+
+def test_factory_raises_when_slash_explicit_unavailable():
+    """_explicit=True + missing capability → CapabilityError (fail-closed)."""
+    factory = VoiceSessionFactory(registry=None)
+    spec = ModeSpec(
+        VoiceMode.REALTIME,
+        provider="gemini-live",
+        options={"_explicit": True},
+    )
+    vc = _mk_vc()
+    adapter = _mk_adapter()
+
+    import os
+
+    prior = os.environ.pop("GEMINI_API_KEY", None)
+    try:
+        with pytest.raises(CapabilityError) as excinfo:
+            factory.build(spec, vc, adapter)
+    finally:
+        if prior is not None:
+            os.environ["GEMINI_API_KEY"] = prior
+    assert excinfo.value.mode is VoiceMode.REALTIME
+    assert any("GEMINI_API_KEY" in m for m in excinfo.value.missing)
+
+
+def test_factory_realtime_path_uses_resolve_bridge_params(monkeypatch):
+    """RealtimeSession is built with system_prompt/voice from
+    _resolve_bridge_params (the v0.3.9 regression fence) when backend is
+    resolved via the registry."""
+    from hermes_s2s._internal import discord_bridge
+
+    # Fake cfg so _resolve_bridge_params returns a known (prompt, voice).
+    class _FakeCfg:
+        realtime_provider = "gemini-live"
+        realtime_options = {
+            "gemini_live": {
+                "system_prompt": "MARKER-FROM-CFG",
+                "voice": "Puck",
+            }
+        }
+
+    fake_cfg = _FakeCfg()
+
+    # Patch load_config via the factory's lazy import point.
+    import hermes_s2s.config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "load_config", lambda: fake_cfg, raising=False)
+
+    # Fake registry that returns a fake backend.
+    fake_backend = object()
+    registry = MagicMock()
+    registry.resolve_realtime = MagicMock(return_value=fake_backend)
+
+    factory = VoiceSessionFactory(registry=registry)
+    # Set GEMINI_API_KEY so capability gate passes.
+    import os
+
+    prior = os.environ.get("GEMINI_API_KEY")
+    os.environ["GEMINI_API_KEY"] = "xyz"
+    try:
+        spec = ModeSpec(
+            VoiceMode.REALTIME,
+            provider="gemini-live",
+            options={"_explicit": True},
+        )
+        vc = _mk_vc()
+        adapter = _mk_adapter()
+        session = factory.build(spec, vc, adapter)
+    finally:
+        if prior is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = prior
+
+    assert isinstance(session, RealtimeSession)
+    assert session._system_prompt == "MARKER-FROM-CFG"
+    assert session._voice == "Puck"
+    assert session._backend is fake_backend
+
+
+# --- discord_bridge join_voice_channel wrapper + CapabilityError rollback ---
+
+
+def test_capability_error_rolls_back_vc_join(monkeypatch):
+    """When factory.build raises CapabilityError inside the wrapped
+    join_voice_channel, the wrapper must:
+      1. Call voice_client.disconnect() (if connected).
+      2. Not propagate the exception into discord.py.
+
+    We simulate by calling the installed wrapper directly on a stub
+    adapter, with a monkey-patched _install_bridge_on_adapter that
+    raises CapabilityError.
+    """
+    import asyncio as _asyncio
+    import sys
+
+    from hermes_s2s._internal import discord_bridge
+
+    class _StubAdapterCls:
+        async def join_voice_channel(self, channel):
+            # Simulate "Hermes's original join" — record a connected VC.
+            self._connected_channel = channel
+            return True
+
+        async def leave_voice_channel(self, *a, **k):
+            return None
+
+    stub_mod = types.ModuleType("gateway.platforms.discord")
+    stub_mod.DiscordAdapter = _StubAdapterCls
+    monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    monkeypatch.setitem(
+        sys.modules, "gateway.platforms", types.ModuleType("gateway.platforms")
+    )
+    monkeypatch.setitem(sys.modules, "gateway.platforms.discord", stub_mod)
+
+    # Patch _install_bridge_on_adapter to raise CapabilityError — this
+    # simulates the factory inside the wrapper refusing to build.
+    def _raise_capability_error(adapter, channel, ctx):
+        raise CapabilityError(
+            ["env:GEMINI_API_KEY"], VoiceMode.REALTIME
+        )
+
+    monkeypatch.setattr(
+        discord_bridge, "_install_bridge_on_adapter", _raise_capability_error
+    )
+
+    # Install wrapper + capture mock VC.
+    disconnect_mock = AsyncMock()
+    vc = MagicMock()
+    vc.is_connected = MagicMock(return_value=True)
+    vc.disconnect = disconnect_mock
+
+    # Stub the adapter's state so the wrapper can find the VC.
+    adapter = _StubAdapterCls()
+    guild = MagicMock()
+    guild.id = 42
+    channel = MagicMock()
+    channel.guild = guild
+    channel.id = 100
+    adapter._voice_clients = {42: vc}
+    adapter._voice_text_channels = {}
+
+    # Install the wrap.
+    discord_bridge._install_via_monkey_patch(ctx=None)
+    wrapped = _StubAdapterCls.join_voice_channel
+    assert getattr(wrapped, discord_bridge._BRIDGE_WRAPPED_MARKER, False)
+
+    async def _invoke():
+        return await wrapped(adapter, channel)
+
+    # The wrapper must NOT propagate CapabilityError.
+    result = _asyncio.run(_invoke())
+    # Return value should still be the original True (VC join succeeded
+    # before we refused to attach the bridge), OR the wrapper can return
+    # None after rollback — accept either but require disconnect() was
+    # called.
+    assert disconnect_mock.await_count == 1, (
+        "wrapper must call vc.disconnect() on CapabilityError"
+    )
+    # Sanity: the join result isn't propagated as an exception.
+    assert result is True or result is None
