@@ -23,17 +23,30 @@ which the user asked for explicitly:
 
 **RESTORED items after Phase 8 plan critique surfaced P0s:**
 
-- **W4b M4.4 — 3-bucket tool-export RESTORED.** Phase 8 review (security
-  reviewer P0-F1) found that collapsing to 2 buckets silently promotes
-  research-15 §5's `ask`-bucket tools (`read_file`, `search_files`,
-  `session_search`, `memory`, `browser_navigate`, HA reads) into
-  `default_exposed`, creating a voice-to-filesystem-read path. Per
-  ADR-0014 §3 fail-closed rule, 0.4.0 ships 3 buckets. The synchronous
-  user-prompt-during-realtime UX for the `ask` bucket is implemented as:
-  bot speaks "ARIA wants to read FILENAME. Say yes or no" + 5s window;
-  STT response routed to a one-off pending-tool-call yes/no matcher.
-  If no response in 5s: deny. Implementation cost: ~80 LOC additional
-  in `meta_dispatcher.py`. Acceptable tradeoff vs the security regression.
+- **W4b M4.4 — 3-bucket tool-export RESTORED (then provisionally
+  downgraded to 2-bucket for 0.4.0).** Phase 8 plan review (security
+  reviewer P0-F1) originally found that collapsing to 2 buckets
+  silently promotes research-15 §5's `ask`-bucket tools (`read_file`,
+  `search_files`, `session_search`, `memory`, `browser_navigate`, HA
+  reads) into `default_exposed`, creating a voice-to-filesystem-read
+  path. 0.4.0 was re-scoped to ship 3 buckets with a synchronous
+  "ARIA wants to read FILENAME. Say yes or no" + 5s window flow in
+  `meta_dispatcher`.
+
+  **Phase-8 FINAL review (P0-2) caught a follow-on gap:** the
+  synchronous voice-confirm flow never actually landed — the bucket
+  table exists but `build_tool_manifest` adds `ask` entries to the
+  manifest unguarded. Shipping that state would be strictly worse
+  than pre-0.4.0: silent user-data-read exposure with no gate.
+
+  **Resolution for 0.4.0 (PROVISIONAL, 2-bucket fail-closed):** the
+  15 `ask` candidates are promoted into `deny` for 0.4.0. The `ASK`
+  set ships empty with a `TODO(0.4.1)` marker. 0.4.1 will land the
+  synchronous voice-confirm flow in `meta_dispatcher` and repopulate
+  `ASK`. A CI-fence test
+  (`tests/test_tool_export.py::test_ask_bucket_empty_for_0_4_0`)
+  asserts the empty-ASK invariant until 0.4.1 flips it. See
+  ADR-0014 "0.4.0 implementation note" for the full rationale.
 
 - **W5a migration — UNAMBIGUATED.** The original "Scope refinements"
   said "NO migrate_0_4 script" but the W5a body still referenced it.
