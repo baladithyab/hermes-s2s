@@ -941,19 +941,51 @@ def _attach_realtime_to_voice_client(
     except Exception as exc:
         logger.warning("hermes-s2s: voice_client.play(QueuedPCMSource) failed: %s", exc)
 
-    # (f) Start the session on the VC's asyncio loop (thread-safe). The
-    # session's connect-before-pumps fence (W1b M1.5) means bridge.start()
-    # doesn't race the backend handshake.
+    # (f) Start the session AND the bridge on the VC's asyncio loop.
+    #
+    # CRITICAL (v0.4.1 hotfix): RealtimeSession._on_start() runs the
+    # connect-before-pumps regression fence at the session boundary, but
+    # the SESSION's own pump tasks are no-op shims (sleep-3600). The
+    # actual production audio pump lives in RealtimeAudioBridge.start()
+    # which spawns _pump_input / _pump_output (audio_bridge.py:458-459).
+    # In v0.4.0 we forgot to invoke bridge.start() after session.start(),
+    # so frames piled up in BridgeBuffer's input queue (capacity 50) and
+    # dropped — exactly the "100 input frames dropped" symptom seen in
+    # production. This was a real regression vs v0.3.x where the inline
+    # construction called bridge.start() directly.
+    #
+    # Order matters: session.start() awaits backend.connect() first
+    # (regression fence). bridge.start() ALSO awaits backend.connect() —
+    # but RealtimeAudioBridge.start() is idempotent (early-return when
+    # self._task is not None and not done), AND backend connect() is also
+    # safe to call twice on a live WS. The redundant connect is the cost
+    # of keeping both layers' fence-tests independent. A future tidy-up
+    # is to teach the session to invoke bridge.start() directly and have
+    # the bridge skip its connect when it sees an already-connected
+    # backend; tracked as 0.4.2 cleanup.
+    async def _start_session_and_bridge() -> None:
+        await session.start()
+        try:
+            await bridge.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "hermes-s2s: bridge.start() failed (frames will not flow "
+                "to backend): %s",
+                exc,
+            )
+
     try:
         loop = getattr(voice_client, "loop", None)
         if loop is not None:
-            asyncio.run_coroutine_threadsafe(session.start(), loop)
+            asyncio.run_coroutine_threadsafe(_start_session_and_bridge(), loop)
         else:  # pragma: no cover — defensive
             logger.warning(
                 "hermes-s2s: voice_client.loop is None — cannot start session"
             )
     except Exception as exc:  # pragma: no cover — defensive
-        logger.warning("hermes-s2s: scheduling session.start() failed: %s", exc)
+        logger.warning(
+            "hermes-s2s: scheduling session+bridge start failed: %s", exc
+        )
 
     # (g) Track bridge on adapter for legacy leave-voice-channel cleanup.
     # This dict is still consumed by _wrap_leave_voice_channel below.

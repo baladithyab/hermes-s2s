@@ -388,7 +388,16 @@ def test_attach_realtime_wires_bridge_when_mode_is_realtime(monkeypatch):
         _install_b1_b2_stubs(monkeypatch)
     )
 
-    fake_backend = object()
+    fake_backend = mock.MagicMock(name="backend")
+    fake_backend.connect = mock.AsyncMock(name="backend.connect")
+    fake_backend.send_audio_chunk = mock.AsyncMock(name="backend.send_audio_chunk")
+    fake_backend.recv_events = mock.MagicMock(name="backend.recv_events")
+    # recv_events should return an async iterator; an empty one suffices.
+    async def _empty_aiter():
+        if False:
+            yield
+        return
+    fake_backend.recv_events.side_effect = lambda: _empty_aiter()
     fake_cfg = types.SimpleNamespace(
         mode="realtime",
         realtime_provider="gemini-live",
@@ -441,25 +450,22 @@ def test_attach_realtime_wires_bridge_when_mode_is_realtime(monkeypatch):
     # voice_client.play called with a QueuedPCMSource built from bridge.buffer
     QueuedPCMSourceCls.assert_called_once_with(mock.sentinel.bridge_buffer)
     vc.play.assert_called_once_with(QueuedPCMSourceCls.return_value)
-    # bridge.start() scheduled on the VC's loop
+    # bridge.start() scheduled on the VC's loop (via the
+    # _start_session_and_bridge wrapper coroutine — v0.4.1 hotfix).
     run_coro.assert_called_once()
     _, kw = run_coro.call_args
     coro_arg = run_coro.call_args.args[0]
     loop_arg = run_coro.call_args.args[1]
     assert loop_arg is vc.loop
-    # W1c: the factory now schedules session.start() (not bridge.start())
-    # on the VC loop. The session's _on_start performs the connect-before-
-    # pumps fence (W1b M1.5) and is responsible for wiring the bridge.
-    # So we only assert run_coroutine_threadsafe was called with a coroutine
-    # object from the RealtimeSession — which is verified by the loop_arg
-    # assertion above. The raw bridge.start() no longer fires directly.
+    # v0.4.1 hotfix: the wrapper schedules session.start() AND bridge.start().
+    # Drive the wrapper coroutine to completion and assert bridge.start was
+    # invoked. The bridge_instance.start mock returns a fresh coroutine each
+    # call (side_effect=lambda: _fake_start()).
+    import asyncio as _asyncio
+    _asyncio.run(coro_arg)
+    bridge_instance.start.assert_called_once()
     # Tracking for cleanup
     assert getattr(adapter, "_s2s_bridges", {}).get(1234) is bridge_instance
-    # Close the coroutine we never awaited to keep pytest warnings quiet.
-    try:
-        coro_arg.close()
-    except Exception:
-        pass
 
 
 def test_attach_realtime_is_noop_when_mode_is_cascaded(monkeypatch):
