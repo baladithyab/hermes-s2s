@@ -43,11 +43,29 @@ class _DummyChannelType:  # pragma: no cover — marker class
 def _install_discord_stub() -> None:
     """Ensure ``import discord`` inside ThreadResolver yields predictable types.
 
-    We don't want to accidentally pick up a real discord.py install from
-    the test environment; a tiny stub module gives every test a stable
-    ForumChannel / ChannelType to compare against.
+    We only install the stub if ``discord`` isn't already importable —
+    if the real ``discord.py`` is on the path (as in the dev venv),
+    leave it alone. That way other tests that poke at
+    ``importlib.util.find_spec("discord")`` (e.g. test_setup_wizard)
+    keep seeing the real module.
+
+    When we DO install, we attach a proper ``ModuleSpec`` so
+    ``find_spec`` doesn't raise ``ValueError: __spec__ is None``.
     """
+    import importlib.machinery
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("discord")
+    except (ValueError, ModuleNotFoundError):
+        spec = None
+
+    if spec is not None:
+        # Real discord is importable; don't override it.
+        return
+
     stub = types.ModuleType("discord")
+    stub.__spec__ = importlib.machinery.ModuleSpec("discord", loader=None)
     stub.ForumChannel = _DummyForumChannel  # type: ignore[attr-defined]
     stub.ChannelType = _DummyChannelType  # type: ignore[attr-defined]
     sys.modules["discord"] = stub

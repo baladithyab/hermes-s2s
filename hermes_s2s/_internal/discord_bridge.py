@@ -53,7 +53,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Tuple
+from functools import partial
+from typing import Any, Optional, Tuple
 
 from hermes_s2s.voice import (
     CapabilityError,
@@ -61,6 +62,8 @@ from hermes_s2s.voice import (
     VoiceMode,
     VoiceSessionFactory,
 )
+from hermes_s2s.voice.threads import ThreadResolver
+from hermes_s2s.voice.transcript import TranscriptMirror
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +307,19 @@ def _install_via_monkey_patch(ctx: Any = None) -> None:
         return
 
     async def join_voice_channel_wrapped(self, channel):  # type: ignore[no-untyped-def]
-        # Let Hermes do its normal connect + VoiceReceiver setup first.
+        # W3b M3.4 — resolve target thread + construct a TranscriptMirror
+        # BEFORE the original join runs so Hermes core's runner sees the
+        # thread context when it snapshots event.source. Best-effort:
+        # failures are logged inside the helper and don't block the VC
+        # join (voice still works; only the text-mirror is lost).
+        try:
+            await _resolve_and_mirror_thread(self, channel)
+        except Exception as exc:  # noqa: BLE001 — never break voice join
+            logger.warning(
+                "hermes-s2s: pre-join thread resolution failed: %s", exc
+            )
+
+        # Let Hermes do its normal connect + VoiceReceiver setup.
         result = await original(self, channel)
         if result:
             try:
@@ -379,6 +394,99 @@ def _vtuple(v: str) -> Tuple[int, ...]:
 # ---------------------------------------------------------------------------
 # Bridge attachment — resolves adapter/vc/receiver then delegates to _attach_*
 # ---------------------------------------------------------------------------
+
+
+async def _resolve_and_mirror_thread(
+    adapter: Any, channel: Any
+) -> Optional[int]:
+    """Resolve a target thread + stash a TranscriptMirror on the adapter.
+
+    W3b M3.4 — called from the wrapped ``join_voice_channel`` BEFORE the
+    original join runs so Hermes core's runner snapshots the thread
+    context when it captures ``event.source``. Returns the resolved
+    thread_id (int) or ``None`` if no thread could be resolved (forum
+    parent, missing event, resolver failure).
+
+    The helper is defensive in the face of missing adapter state —
+    voice joins invoked outside of a normal message-event flow (e.g. a
+    programmatic call) won't have a ``_current_event`` on the adapter,
+    in which case we skip thread resolution entirely rather than crash.
+
+    Side effects:
+        * On success, mutates ``event.source.thread_id`` and
+          ``event.source.chat_type``. ``SessionSource`` may be frozen
+          in some Hermes versions; we use ``setattr`` defensively and
+          catch the AttributeError-on-frozen-dataclass path.
+        * Stashes a ``TranscriptMirror`` on
+          ``adapter._s2s_transcript_mirrors`` keyed on ``guild_id`` so
+          ``_attach_realtime_to_voice_client`` can wire the sink after
+          the factory builds the session.
+    """
+    event = (
+        getattr(adapter, "_current_event", None)
+        or getattr(adapter, "_pending_voice_event", None)
+    )
+    if event is None:
+        logger.debug(
+            "hermes-s2s.discord_bridge: no current event on adapter; "
+            "skipping thread resolution (voice still works, no mirror)"
+        )
+        return None
+
+    try:
+        from ..config import load_config
+
+        cfg = load_config()
+        cfg_dict = cfg.dict() if hasattr(cfg, "dict") else {}
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug(
+            "hermes-s2s.discord_bridge: config load failed (%s); "
+            "using default thread-resolver config",
+            exc,
+        )
+        cfg_dict = {}
+
+    resolver = ThreadResolver(cfg_dict)
+    try:
+        thread_id = await resolver.resolve(adapter, event, channel)
+    except Exception as exc:  # noqa: BLE001 — never break voice join
+        logger.warning(
+            "hermes-s2s.discord_bridge: ThreadResolver.resolve failed: %s", exc
+        )
+        return None
+
+    if thread_id is None:
+        return None
+
+    # Mutate event.source — defensive because SessionSource may be
+    # frozen in some Hermes versions.
+    source = getattr(event, "source", None)
+    if source is not None:
+        try:
+            setattr(source, "thread_id", str(thread_id))
+            setattr(source, "chat_type", "thread")
+        except Exception as exc:  # noqa: BLE001 — frozen-dataclass tolerant
+            logger.debug(
+                "hermes-s2s.discord_bridge: could not mutate event.source "
+                "(possibly frozen): %s",
+                exc,
+            )
+
+    # Stash a mirror on the adapter keyed by guild for the attach step.
+    mirror = TranscriptMirror(adapter)
+    mirrors = getattr(adapter, "_s2s_transcript_mirrors", None)
+    if mirrors is None:
+        mirrors = {}
+        try:
+            adapter._s2s_transcript_mirrors = mirrors
+        except Exception:  # pragma: no cover — defensive
+            pass
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if guild_id is not None:
+        mirrors[guild_id] = (mirror, thread_id)
+
+    return thread_id
 
 
 def _install_bridge_on_adapter(adapter: Any, channel: Any, ctx: Any = None) -> None:
@@ -598,6 +706,29 @@ def _attach_realtime_to_voice_client(
             logger.warning(
                 "hermes-s2s: failed to install frame callback on VoiceReceiver: %s", exc
             )
+
+    # (d.5) W3b M3.4 — if a TranscriptMirror was stashed for this guild
+    # during the pre-join resolver step, install it as the bridge's
+    # transcript sink. The mirror's schedule_send is a SYNC callable
+    # that handles loop-scheduling internally, matching the bridge's
+    # `sink(*, role, text, final)` contract.
+    try:
+        mirrors = getattr(adapter, "_s2s_transcript_mirrors", None) or {}
+        slot = mirrors.get(guild_id) if guild_id is not None else None
+        if slot is not None:
+            mirror, thread_id = slot
+            bridge._transcript_sink = partial(
+                mirror.schedule_send, channel_id=int(thread_id)
+            )
+            logger.info(
+                "hermes-s2s: transcript mirror wired (guild=%s, thread=%s)",
+                guild_id,
+                thread_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "hermes-s2s: failed to wire transcript mirror: %s", exc
+        )
 
     # (e) Outbound audio — route bridge buffer to the VoiceClient
     try:
