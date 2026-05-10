@@ -387,6 +387,57 @@ def _attach_realtime_to_voice_client(
     if guild_id is not None:
         bridges[guild_id] = bridge
 
+    # (i) Silence Hermes core's cascaded voice loop while realtime is active.
+    # Hermes core wires:
+    #   adapter._voice_input_callback = self._handle_voice_channel_input
+    # which fires faster-whisper STT every time the VoiceReceiver flushes a
+    # speech buffer, then injects the transcript as a text turn — duplicating
+    # what our realtime backend is already doing, and on this user's GPU
+    # spamming "cuBLAS failed" errors. Stash the original and replace with a
+    # no-op for the lifetime of this bridge; restored in leave_voice_channel.
+    try:
+        prev_input_cb = getattr(adapter, "_voice_input_callback", None)
+        if prev_input_cb is not None and not getattr(prev_input_cb, "_s2s_silenced", False):
+            async def _s2s_silenced_input_callback(*_args, **_kwargs):
+                """No-op: realtime backend handles this user's audio directly."""
+                return None
+            _s2s_silenced_input_callback._s2s_silenced = True  # type: ignore[attr-defined]
+            _s2s_silenced_input_callback._s2s_prev = prev_input_cb  # type: ignore[attr-defined]
+            adapter._voice_input_callback = _s2s_silenced_input_callback
+            logger.info(
+                "hermes-s2s: silenced cascaded voice STT (was %s); realtime backend owns audio now",
+                getattr(prev_input_cb, "__qualname__", repr(prev_input_cb)),
+            )
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("hermes-s2s: could not silence _voice_input_callback: %s", exc)
+
+    # Also disable Hermes core's auto-TTS path for this chat so it doesn't
+    # try to TTS-play the agent's text reply (which would conflict with the
+    # realtime backend's already-streaming audio). This is best-effort —
+    # different Hermes versions expose the toggle differently.
+    try:
+        text_chans = getattr(adapter, "_voice_text_channels", {}) or {}
+        chat_id = text_chans.get(guild_id)
+        if chat_id is not None:
+            disable = getattr(adapter, "_set_auto_tts_enabled", None)
+            if callable(disable):
+                disable(chat_id, False)
+                logger.info(
+                    "hermes-s2s: disabled cascaded auto-TTS for chat=%s (realtime backend owns audio out)",
+                    chat_id,
+                )
+            else:
+                # Fallback: flip the dict directly if it exists.
+                auto_tts = getattr(adapter, "_auto_tts_enabled", None)
+                if isinstance(auto_tts, dict):
+                    auto_tts[str(chat_id)] = False
+                    logger.info(
+                        "hermes-s2s: disabled cascaded auto-TTS via dict for chat=%s",
+                        chat_id,
+                    )
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("hermes-s2s: cascaded auto-TTS disable best-effort failed: %s", exc)
+
     logger.info(
         "hermes-s2s: realtime audio bridge attached (guild=%s, backend=%s)",
         guild_id,
@@ -539,6 +590,21 @@ def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
                         await res
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("hermes-s2s: bridge.close() failed: %s", exc)
+
+        # Restore Hermes core's silenced cascaded callback (mirror of step (i)
+        # in _attach_realtime_to_voice_client). If the user re-joins in
+        # cascaded mode after this, the original STT path takes over again.
+        try:
+            cb = getattr(self, "_voice_input_callback", None)
+            prev = getattr(cb, "_s2s_prev", None)
+            if cb is not None and getattr(cb, "_s2s_silenced", False):
+                self._voice_input_callback = prev
+                logger.info(
+                    "hermes-s2s: restored cascaded voice STT callback (was silenced)"
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("hermes-s2s: restore _voice_input_callback failed: %s", exc)
+
         return await original(self, *args, **kwargs)
 
     setattr(leave_voice_channel_wrapped, _S2S_LEAVE_WRAPPED_MARKER, True)

@@ -450,9 +450,12 @@ class RealtimeAudioBridge:
         """Supervise the two pump coroutines."""
         in_task = asyncio.create_task(self._pump_input(), name="bridge.pump_input")
         out_task = asyncio.create_task(self._pump_output(), name="bridge.pump_output")
-        self._children = [in_task, out_task]
+        # G3+: periodic stats heartbeat (every 10s) so live debugging doesn't
+        # need DEBUG-level logs. Cheap and silent if nothing is happening.
+        stats_task = asyncio.create_task(self._stats_heartbeat(), name="bridge.stats_heartbeat")
+        self._children = [in_task, out_task, stats_task]
         try:
-            await asyncio.gather(in_task, out_task, return_exceptions=True)
+            await asyncio.gather(in_task, out_task, stats_task, return_exceptions=True)
         except asyncio.CancelledError:
             for t in self._children:
                 if not t.done():
@@ -467,6 +470,48 @@ class RealtimeAudioBridge:
                         await t
                     except (asyncio.CancelledError, Exception):  # noqa: BLE001
                         pass
+
+    async def _stats_heartbeat(self) -> None:
+        """Log bridge stats every 10s while running. Cheap, INFO level.
+
+        Surfaces frame-flow data without requiring DEBUG logs. If you see
+        ``frames_in=0`` after speaking for 5+ seconds, the input shim never
+        delivered frames. If ``frames_in>0`` but ``frames_out=0``, the
+        backend isn't producing audio (check setup config / VAD).
+        """
+        prev_in = -1
+        prev_emitted = -1
+        prev_underflow = -1
+        try:
+            while True:
+                await asyncio.sleep(10.0)
+                try:
+                    s = self.stats()
+                except Exception:  # noqa: BLE001
+                    continue
+                # Only log when something actually changed since the last
+                # heartbeat — keeps idle bridges from spamming.
+                if (
+                    s.get("queue_depth_in", 0) > 0
+                    or s.get("frames_emitted", 0) != prev_emitted
+                    or s.get("frames_underflow", 0) != prev_underflow
+                    or s.get("dropped_input", 0) > 0
+                ):
+                    logger.info(
+                        "bridge stats: q_in=%s q_out=%s frames_emitted=%s "
+                        "frames_underflow=%s dropped_in=%s tool_tasks=%s",
+                        s.get("queue_depth_in"),
+                        s.get("queue_depth_out"),
+                        s.get("frames_emitted"),
+                        s.get("frames_underflow"),
+                        s.get("dropped_input"),
+                        s.get("tool_tasks_in_flight"),
+                    )
+                    prev_in = s.get("queue_depth_in", 0)
+                    prev_emitted = s.get("frames_emitted", 0)
+                    prev_underflow = s.get("frames_underflow", 0)
+        except asyncio.CancelledError:
+            raise
 
     async def _pump_input(self) -> None:
         """Drain input queue -> resample to backend rate -> backend.send_audio_chunk."""
