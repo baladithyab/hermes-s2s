@@ -4,6 +4,125 @@ This is the working reference for how the 0.2.0 integration actually flows end-t
 
 Source: <https://github.com/baladithyab/hermes-s2s>. Rationale: [ADR-0004](adrs/0004-command-provider-interception.md).
 
+## 0.4.0 — the four modes at a glance
+
+As of 0.4.0, `s2s.mode` is one of exactly **four modes** (up from the
+pre-0.4 two-mode world of `cascaded | duplex`). Pick one; every other
+knob is a detail under it:
+
+| Mode | What runs where | Latency | Best for |
+|---|---|---|---|
+| `cascaded` | STT → Hermes LLM → TTS, each stage a discrete provider | ~0.6–1.5 s | Mix-and-match, privacy on one stage, cheapest cloud |
+| `pipeline` | Hermes's own tightly-coupled STT→LLM→TTS pipeline (no per-stage swap, but one process, no subprocess overhead) | ~0.4–1.0 s | Lowest-overhead cascaded when you don't need per-stage provider swaps |
+| `realtime` | Full duplex WS to Gemini Live / GPT-4o Realtime, audio both ways, Hermes tools round-trip through the bridge | ~0.5–0.7 s | Interactive, barge-in, native voice quality |
+| `s2s-server` | WS to your own `streaming-speech-to-speech` (or compatible) server; the whole turn lives there | ~0.25 s on RTX 5090 | Local v6 pipeline, strict privacy, lowest latency |
+
+The legacy `s2s.mode: duplex` boolean is gone. The 0.4.0 config loader
+auto-translates it to `realtime` on first load (sentinel guard prevents
+re-translation). For a clean rewrite, run:
+
+```bash
+python -m hermes_s2s.migrate_0_4            # rewrite in place (creates .bak)
+python -m hermes_s2s.migrate_0_4 --dry-run  # show diff, write nothing
+python -m hermes_s2s.migrate_0_4 --rollback # restore from .bak
+```
+
+### The `/s2s` slash command (Discord, 0.4.0+)
+
+0.4.0 ships a plugin-owned `/s2s` slash command that Hermes registers
+when `HERMES_S2S_MONKEYPATCH_DISCORD=1` is set. It's the fastest way
+to switch modes in a live Discord session without touching YAML:
+
+```
+/s2s                         # show current mode + backend readiness
+/s2s mode realtime           # switch mode for this session only
+/s2s mode cascaded           # ...and back
+/s2s test                    # TTS smoke test — bot speaks a short phrase
+/s2s test "hello there"      # ...with specific text
+```
+
+`/s2s mode <name>` is session-scoped — it does NOT write to
+`config.yaml`. Edit YAML (or re-run `hermes s2s setup`) to make the
+choice persistent across restarts.
+
+### Thread mirroring (Discord, 0.4.0+)
+
+When `/voice join` is invoked from inside a **thread**, the bot
+reuses that thread for STT transcripts and assistant replies.
+Invoked from a plain channel, the bot **auto-creates a public
+thread** (auto-archive: 1 day) named from the configured template
+and mirrors all transcripts into it. Forum parents are detected and
+fall back to the parent channel (no thread auto-create). Both
+templates are configurable:
+
+```yaml
+s2s:
+  voice:
+    thread_name_template: "Voice: {user_display_name} ({date})"
+    thread_starter_message: "Voice transcripts for this session…"
+```
+
+See ADR-0012 and `docs/design-history/research/14-thread-resolution.md`
+for the resolver decision table.
+
+### Voice meta-commands (0.4.0+)
+
+With voice mode active, you can control the session hands-free by
+saying the wakeword followed by a verb. Defaults:
+
+- **Wakeword:** `hermes` (configurable at `s2s.voice.wakeword`)
+- **Verbs:** `new`, `compress`, `title`, `branch`, `stop`, `clear`
+  (`resume` is planned for 0.4.1)
+
+Examples (spoken aloud into the VC):
+
+- "hermes new" — start a new conversation turn / reset context
+- "hermes compress" — summarize the current session
+- "hermes title" — ask Hermes to title the current thread
+- "hermes branch" — branch this session into a new thread
+- "hermes stop" — cancel the current assistant utterance / tool run
+- "hermes clear" — clear the conversation history
+
+Meta-commands are detected by the `MetaCommandSink` wakeword grammar
+and dispatched through the gateway's `MetaDispatcher` BEFORE the LLM
+sees the transcript, so they're deterministic and never get
+misrouted to the model. See ADR-0011.
+
+### Voice persona overlay + prompt-injection defense (0.4.0+)
+
+Voice mode layers a short persona prompt over Hermes's base system
+prompt (keeps replies short, natural, 1–3 sentences). The overlay
+includes a hard-coded **prompt-injection-defense block** that refuses
+overrides of the "ignore previous instructions" / "you are now a
+different assistant" family when they appear inside a spoken
+transcript.
+
+**Security note:** this is a defense-in-depth layer, not a
+replacement for auth. The usual Discord `DISCORD_ALLOWED_USERS`
+allow-list still gates *who* can talk to the bot; the persona
+overlay defends against a malicious payload *from within* an
+allowed user's speech.
+
+See ADR-0013 and `docs/design-history/research/13-persona-overlay.md`
+for the prompt-design rationale and the attack taxonomy the
+defense targets.
+
+### 3-bucket tool-export policy (0.4.0+)
+
+Voice-mode tools now fall into three explicit buckets:
+
+- **Always-on** — `hermes_meta_*` tools exported to every voice
+  session regardless of user toolset config (these back the
+  meta-commands above).
+- **Opt-in** — standard Hermes tools; exported only if they're in
+  the user's configured toolset.
+- **Deny-listed** — tools that are dangerous or nonsensical in a
+  voice context (e.g. interactive TUI tools). Never exported,
+  enforced by a CI fence in `tests/test_tool_export_policy.py`.
+
+ADR-0014 has the bucket definitions; the policy module lives at
+`hermes_s2s.voice.tool_bridge`.
+
 ## 1. How Hermes voice mode finds providers
 
 When Hermes receives voice input (Discord VC audio frame, Telegram voice note, CLI mic capture), it runs a cascaded STT → LLM → TTS pipeline. For the STT and TTS stages it resolves a **provider** by name from your `~/.hermes/config.yaml` / environment and hands off the actual work.
