@@ -54,7 +54,7 @@ def _realtime_s2s_block(profile: str) -> dict:
             "realtime": {
                 "provider": "gemini-live",
                 "gemini_live": {
-                    "model": "gemini-live-2.5-flash",
+                    "model": "gemini-2.5-flash-native-audio-latest",
                     "voice": "Aoede",
                     "system_prompt": "You are a helpful voice assistant. Respond briefly.",
                 },

@@ -20,7 +20,7 @@ s2s:
   realtime:
     provider: gemini-live        # gemini-live | gpt-realtime | gpt-realtime-mini
     gemini_live:
-      model: gemini-live-2.5-flash    # half-cascade ($0.06 / 30min)
+      model: gemini-2.5-flash-native-audio-latest    # native-audio default; or 'gemini-3.1-flash-live-preview' for newer
       voice: Aoede                    # Aoede | Charon | Fenrir | Kore | Puck | ...
     openai:
       model: gpt-realtime-mini        # gpt-realtime-mini ($0.45) | gpt-realtime ($1.44)

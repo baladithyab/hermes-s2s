@@ -167,7 +167,7 @@ def test_setup_realtime_gemini_writes_full_config(capsys, tmp_path, monkeypatch)
     assert parsed["s2s"]["mode"] == "realtime"
     assert parsed["s2s"]["realtime"]["provider"] == "gemini-live"
     assert (
-        parsed["s2s"]["realtime"]["gemini_live"]["model"] == "gemini-live-2.5-flash"
+        parsed["s2s"]["realtime"]["gemini_live"]["model"] == "gemini-2.5-flash-native-audio-latest"
     )
     assert parsed["s2s"]["realtime"]["gemini_live"]["voice"] == "Aoede"
 

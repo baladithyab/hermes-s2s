@@ -67,7 +67,7 @@ plugins:
     realtime:
       provider: gemini-live
       gemini-live:
-        model: gemini-live-2.5-flash
+        model: gemini-2.5-flash-native-audio-latest
         voice: Aoede           # also: Puck, Charon, Kore, Fenrir
         language_code: en-US
 ```

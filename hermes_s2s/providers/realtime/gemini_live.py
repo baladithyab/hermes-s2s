@@ -86,7 +86,7 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.api_key_env: str = kwargs.get("api_key_env", "GEMINI_API_KEY")
-        self.model: str = kwargs.get("model", "gemini-live-2.5-flash")
+        self.model: str = kwargs.get("model", "gemini-2.5-flash-native-audio-latest")
         self.voice: str = kwargs.get("voice", "Aoede")
         self.language_code: str = kwargs.get("language_code", "en-US")
         # Allow tests to override the connect URL (mock WS).
@@ -425,7 +425,7 @@ def make_gemini_live(config: Dict[str, Any]) -> GeminiLiveBackend:
     cfg = config or {}
     return GeminiLiveBackend(
         api_key_env=cfg.get("api_key_env", "GEMINI_API_KEY"),
-        model=cfg.get("model", "gemini-live-2.5-flash"),
+        model=cfg.get("model", "gemini-2.5-flash-native-audio-latest"),
         voice=cfg.get("voice", "Aoede"),
         language_code=cfg.get("language_code", "en-US"),
         url=cfg.get("url"),  # primarily for tests
