@@ -484,6 +484,31 @@ def _attach_realtime_to_voice_client(
     channel_obj = getattr(voice_client, "channel", None)
     channel_id = getattr(channel_obj, "id", None)
 
+    # W2a M2.1 part 3: fold the /s2s override store into the router's
+    # ``channel_overrides`` (precedence level 3). The store is the
+    # canonical persistence for per-channel picks made via the
+    # plugin-owned /s2s slash command. Reload on every join so another
+    # process (e.g. a fresh gateway start) writing an override while we
+    # were idle still takes effect. Failure is non-fatal — we just lose
+    # the override for this join.
+    try:
+        from ..voice.slash import get_default_store
+
+        store = get_default_store()
+        store.reload()
+        if guild_id is not None and channel_id is not None:
+            override = store.get(int(guild_id), int(channel_id))
+            if override:
+                router_cfg["s2s"]["voice"].setdefault(
+                    "channel_overrides", {}
+                )[channel_id] = override
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "hermes-s2s: override-store lookup failed (%s); continuing "
+            "without /s2s override",
+            exc,
+        )
+
     try:
         router = ModeRouter(router_cfg)
         spec = router.resolve(guild_id=guild_id, channel_id=channel_id)

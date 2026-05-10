@@ -306,3 +306,81 @@ def test_factory_uses_override_store(tmp_path: Path) -> None:
     # wins (sanity check).
     spec2 = router.resolve(guild_id=777, channel_id=555)
     assert spec2.mode is VoiceMode.CASCADED
+
+
+def test_bridge_folds_store_into_router_channel_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration: ``_attach_realtime_to_voice_client`` must consult the
+    override store and fold the entry into ``router_cfg`` before building
+    the ModeRouter. We run the bridge against mocks, assert the resolver
+    saw the override value, and short-circuit before any real session
+    construction by intercepting the ModeRouter.
+    """
+    from hermes_s2s._internal import discord_bridge
+    from hermes_s2s.voice import slash as slash_mod
+    from hermes_s2s.voice.modes import VoiceMode
+
+    # Point the singleton store at a tmp path and pre-seed an override
+    # for (guild=1001, channel=2002) → "realtime".
+    seeded = S2SModeOverrideStore(path=tmp_path / "overrides.json")
+    seeded.set(1001, 2002, "realtime")
+    monkeypatch.setattr(slash_mod, "_store_singleton", seeded, raising=False)
+
+    # Fake cfg object: mode defaults to cascaded.
+    class FakeCfg:
+        mode = "cascaded"
+        voice = None
+        realtime_provider = None
+
+    monkeypatch.setattr(
+        discord_bridge, "load_config", lambda: FakeCfg(), raising=False
+    )
+    # Above only works if load_config is imported lazily in bridge, which
+    # it is — but we need to also stub the ..config module path.
+    fake_cfg_mod = MagicMock()
+    fake_cfg_mod.load_config = lambda: FakeCfg()
+    monkeypatch.setitem(
+        __import__("sys").modules, "hermes_s2s.config", fake_cfg_mod
+    )
+
+    # Capture the router_cfg that ModeRouter sees.
+    captured: dict[str, Any] = {}
+
+    class _CaptureRouter:
+        def __init__(self, cfg: Any) -> None:
+            captured["cfg"] = cfg
+
+        def resolve(self, *, guild_id: Any, channel_id: Any) -> Any:
+            # Return a ModeSpec-like that's shaped enough for downstream
+            # code to short-circuit cleanly. We raise after capturing so
+            # the rest of the bridge path short-circuits on the exception
+            # handler and we can assert without mocking the whole factory.
+            captured["guild_id"] = guild_id
+            captured["channel_id"] = channel_id
+            raise RuntimeError("stop here, we captured what we need")
+
+    monkeypatch.setattr(discord_bridge, "ModeRouter", _CaptureRouter)
+
+    # Fake voice_client with guild.id / channel.id = 1001 / 2002.
+    vc = MagicMock()
+    vc.guild.id = 1001
+    vc.channel.id = 2002
+
+    adapter = MagicMock()
+
+    # Call the bridge; it'll call our _CaptureRouter.resolve which raises
+    # RuntimeError; the bridge logs and returns — we just assert the
+    # captured cfg shows our override wired in.
+    discord_bridge._attach_realtime_to_voice_client(adapter, vc, None, None)
+
+    cfg = captured.get("cfg")
+    assert cfg is not None, "ModeRouter was never instantiated"
+    voice_cfg = cfg["s2s"]["voice"]
+    channel_overrides = voice_cfg.get("channel_overrides", {})
+    # Either int or str key — router accepts both. We stored with int.
+    assert channel_overrides.get(2002) == "realtime" or channel_overrides.get(
+        "2002"
+    ) == "realtime", (
+        f"expected channel_overrides[2002]='realtime', got {channel_overrides!r}"
+    )
