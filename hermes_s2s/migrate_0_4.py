@@ -57,6 +57,22 @@ BACKUP_PREFIX = ".bak.0_4_"
 DEFAULT_WAKEWORD = "hey aria"
 DEFAULT_THREAD_NAME_TEMPLATE = "🎤 {user} — {date:%Y-%m-%d %H:%M}"
 
+#: Map legacy 0.3.x ``s2s.mode`` values to the 0.4.0 ``VoiceMode``
+#: vocabulary. 0.3.x called the realtime path ``duplex``; feeding that
+#: verbatim into ``s2s.voice.default_mode`` would produce a value the
+#: 0.4.0 ``VoiceMode`` enum rejects. Any value not listed here passes
+#: through unchanged (so genuinely-unknown modes still surface at
+#: runtime rather than being silently rewritten). See Phase-8 final
+#: shippability review P0-3.
+_LEGACY_MODE_MAP: dict[str, str] = {
+    "duplex": "realtime",       # 0.3.x name for the realtime path
+    "cascaded": "cascaded",
+    "realtime": "realtime",
+    "s2s-server": "s2s-server",
+    "s2s_server": "s2s-server",  # underscore variant from early 0.3.x
+    "pipeline": "pipeline",
+}
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -127,7 +143,17 @@ def translate_config(config: dict) -> tuple[dict, list[str]]:
     else:
         old_mode = s2s.get("mode")
         if isinstance(old_mode, str) and old_mode.strip():
-            voice["default_mode"] = old_mode
+            # Normalise legacy 0.3.x names to the 0.4.0 VoiceMode vocabulary
+            # before copying into s2s.voice.default_mode. 0.3.x called the
+            # realtime path "duplex"; copying that verbatim would produce a
+            # default_mode value VoiceMode rejects at construction time
+            # (Phase-8 final shippability review P0-3).
+            new_mode = _LEGACY_MODE_MAP.get(old_mode, old_mode)
+            if new_mode != old_mode:
+                warnings.append(
+                    f"translated legacy mode '{old_mode}' to '{new_mode}'"
+                )
+            voice["default_mode"] = new_mode
             warnings.append(
                 "s2s.mode is deprecated; migrated to s2s.voice.default_mode"
             )

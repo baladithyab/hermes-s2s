@@ -96,6 +96,42 @@ def test_translate_does_not_mutate_input():
     assert cfg == before, "translate_config must not mutate its input"
 
 
+def test_translate_legacy_duplex_mode_to_realtime():
+    """0.3.x ``mode: duplex`` → 0.4.0 ``default_mode: realtime``.
+
+    Regression fence for Phase-8 final review P0-3. 0.3.x called the
+    realtime path ``duplex`` in its config; copying that value verbatim
+    into ``s2s.voice.default_mode`` produced a value ``VoiceMode``
+    rejects at construction time. The fix is a legacy-name
+    normalisation step in ``translate_config`` — this test asserts that
+    the rewrite happens AND that a warning is surfaced so users see
+    why their mode value changed.
+    """
+    cfg = {"s2s": {"mode": "duplex"}}
+    new_cfg, warnings = migrate_0_4.translate_config(cfg)
+    assert new_cfg["s2s"]["voice"]["default_mode"] == "realtime"
+    assert any(
+        "translated legacy mode 'duplex' to 'realtime'" in w for w in warnings
+    ), f"expected legacy-mode translation warning, got: {warnings}"
+
+
+def test_translate_legacy_s2s_server_underscore_variant():
+    """Early-0.3.x ``mode: s2s_server`` → 0.4.0 ``default_mode: s2s-server``."""
+    cfg = {"s2s": {"mode": "s2s_server"}}
+    new_cfg, warnings = migrate_0_4.translate_config(cfg)
+    assert new_cfg["s2s"]["voice"]["default_mode"] == "s2s-server"
+    assert any("translated legacy mode" in w for w in warnings)
+
+
+def test_translate_unknown_mode_passes_through():
+    """Unknown mode names pass through unchanged (no silent rewrite)."""
+    cfg = {"s2s": {"mode": "totally-bogus-mode"}}
+    new_cfg, warnings = migrate_0_4.translate_config(cfg)
+    assert new_cfg["s2s"]["voice"]["default_mode"] == "totally-bogus-mode"
+    # No translation warning for unknown modes.
+    assert not any("translated legacy mode" in w for w in warnings)
+
+
 # ---------------------------------------------------------------------------
 # CLI driver: dry-run / apply / rollback
 # ---------------------------------------------------------------------------
