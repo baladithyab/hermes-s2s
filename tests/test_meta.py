@@ -337,7 +337,14 @@ def test_lang_name_from_code_known_codes():
 
 
 def test_tool_manifest_excludes_denied():
-    """Deny-bucket tools are hard-removed from the manifest."""
+    """Deny-bucket tools are hard-removed from the manifest.
+
+    Under the 0.4.0 2-bucket policy (P0-2), only the curated
+    default-exposed allow-list (plus hermes_meta_* tools) survives;
+    everything else — including ``terminal`` and ``read_file`` — is
+    fail-closed. The 3-bucket posture with an ``ask`` confirm flow
+    for tools like ``read_file`` is deferred to 0.4.1 (ADR-0014).
+    """
     enabled = [
         {"name": "terminal", "description": "shell"},
         {"name": "web_search", "description": "search"},
@@ -347,7 +354,8 @@ def test_tool_manifest_excludes_denied():
     names = {t["name"] for t in out}
     assert "terminal" not in names
     assert "web_search" in names
-    assert "read_file" in names
+    # read_file is deny-listed in 0.4.0 (promoted to ``ask`` bucket in 0.4.1).
+    assert "read_file" not in names
 
 
 def test_tool_manifest_includes_meta_tools():

@@ -946,3 +946,65 @@ def test_capability_error_rolls_back_vc_join(monkeypatch):
     )
     # Sanity: the join result isn't propagated as an exception.
     assert result is True or result is None
+
+
+# ---------------------------------------------------------------------------
+# P0-6 — leave_voice_channel stops S2S sessions registered on the adapter
+# ---------------------------------------------------------------------------
+
+
+def test_leave_voice_calls_session_stop():
+    """``/voice leave`` must call ``session.stop()`` on matching _s2s_sessions.
+
+    Regression test for P0-6 (session leak on /voice leave): before this
+    fix, pipeline / s2s-server sessions registered on
+    ``adapter._s2s_sessions`` were orphaned when the user left the VC,
+    keeping their subprocess / WS resources open. The
+    ``_wrap_leave_voice_channel`` monkey-patch must iterate the dict and
+    stop every session whose key matches the leaving guild.
+    """
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from hermes_s2s._internal import discord_bridge
+
+    # Minimal stub adapter class that the wrapper can be applied to.
+    class _StubAdapterCls:
+        async def leave_voice_channel(self, *args, **kwargs):
+            return "left"
+
+    # Apply the wrap directly (don't go through _install_via_monkey_patch
+    # — we just want this one function exercised in isolation).
+    discord_bridge._wrap_leave_voice_channel(_StubAdapterCls)
+    wrapped = _StubAdapterCls.leave_voice_channel
+    assert getattr(wrapped, discord_bridge._S2S_LEAVE_WRAPPED_MARKER, False)
+
+    # Build an adapter with two sessions: one matching the leaving
+    # guild (should stop) and one belonging to a different guild
+    # (must be left alone).
+    adapter = _StubAdapterCls()
+    guild_id = 42
+    other_guild_id = 99
+
+    matching_session = MagicMock()
+    matching_session.stop = AsyncMock()
+    non_matching_session = MagicMock()
+    non_matching_session.stop = AsyncMock()
+
+    adapter._s2s_sessions = {
+        (guild_id, 100): matching_session,
+        (other_guild_id, 200): non_matching_session,
+    }
+
+    # Invoke leave with a raw guild id (simplest shape the wrapper
+    # handles — see its guild-id extraction block).
+    result = _asyncio.run(wrapped(adapter, guild_id))
+
+    # Original leave_voice_channel return value flows through.
+    assert result == "left"
+    # Matching session was stopped + removed from the dict.
+    matching_session.stop.assert_awaited_once()
+    assert (guild_id, 100) not in adapter._s2s_sessions
+    # Non-matching session is untouched.
+    non_matching_session.stop.assert_not_called()
+    assert (other_guild_id, 200) in adapter._s2s_sessions

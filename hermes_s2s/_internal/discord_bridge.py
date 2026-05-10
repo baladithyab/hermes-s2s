@@ -1223,6 +1223,39 @@ def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("hermes-s2s: bridge.close() failed: %s", exc)
 
+        # P0-6: stop any S2S sessions registered for this guild on
+        # ``adapter._s2s_sessions``. Non-realtime modes (pipeline,
+        # s2s-server) track their session here so that /voice leave
+        # can shut them down cleanly — before P0-6 the sessions were
+        # orphaned when the user left the VC and kept holding their
+        # WS / subprocess resources open (see P0-6 in the 0.4.0 plan).
+        sessions_dict = getattr(self, "_s2s_sessions", None)
+        if sessions_dict:
+            for key in list(sessions_dict.keys()):
+                # Keys are (guild_id, channel_id) tuples; tolerate
+                # scalar keys too, for forwards-compat.
+                try:
+                    gid = key[0] if isinstance(key, tuple) else key
+                except Exception:  # pragma: no cover — defensive
+                    gid = None
+                if guild_id is not None and gid != guild_id:
+                    continue
+                session = sessions_dict.pop(key, None)
+                if session is None:
+                    continue
+                stop = getattr(session, "stop", None)
+                if not callable(stop):
+                    continue
+                try:
+                    res = stop()
+                    import inspect as _inspect
+                    if _inspect.isawaitable(res):
+                        await res
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.warning(
+                        "hermes-s2s: session.stop() failed: %s", exc
+                    )
+
         # Restore Hermes core's silenced cascaded callback (mirror of step (i)
         # in _attach_realtime_to_voice_client). If the user re-joins in
         # cascaded mode after this, the original STT path takes over again.
