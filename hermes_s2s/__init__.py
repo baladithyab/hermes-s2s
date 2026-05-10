@@ -21,7 +21,7 @@ from .registry import (
     resolve_tts,
 )
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"
 __all__ = [
     "S2SConfig",
     "load_config",

@@ -539,6 +539,58 @@ def _install_frame_callback(voice_receiver: Any, callback: Any) -> None:
     try:
         voice_receiver._on_packet = wrapped_on_packet  # type: ignore[attr-defined]
         setattr(voice_receiver, _FRAME_CB_INSTALLED_MARKER, True)
+        # CRITICAL: Hermes core's VoiceReceiver registers `self._on_packet`
+        # as a socket listener at start() time (gateway/platforms/discord.py:181).
+        # That registration captures the BOUND METHOD by reference — setting
+        # `voice_receiver._on_packet = wrapped_on_packet` only shadows the
+        # attribute; it does NOT replace the registered listener. So unless we
+        # swap the listener too, the wrapper is never called and our frame
+        # callback never fires (frames_emitted stays at 0 forever — the v0.3.6
+        # bridge-stats heartbeat made this glaringly obvious).
+        try:
+            vc = getattr(voice_receiver, "_vc", None)
+            conn = getattr(vc, "_connection", None) if vc is not None else None
+            if conn is not None:
+                # Remove the originally-registered bound method, then add the
+                # wrapper. add_socket_listener accepts any callable.
+                try:
+                    conn.remove_socket_listener(original_on_packet)
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.debug(
+                        "hermes-s2s: remove_socket_listener(original) failed: %s",
+                        exc,
+                    )
+                try:
+                    conn.add_socket_listener(wrapped_on_packet)
+                    setattr(
+                        voice_receiver,
+                        "_hermes_s2s_socket_listener",
+                        wrapped_on_packet,
+                    )
+                    setattr(
+                        voice_receiver,
+                        "_hermes_s2s_original_on_packet",
+                        original_on_packet,
+                    )
+                    logger.info(
+                        "hermes-s2s: swapped socket listener to wrapped _on_packet "
+                        "(frames will now reach the bridge)"
+                    )
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.warning(
+                        "hermes-s2s: add_socket_listener(wrapper) failed; "
+                        "frame callback will not fire: %s",
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "hermes-s2s: could not access voice connection to swap "
+                    "socket listener — frames may not reach the bridge"
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "hermes-s2s: failed to swap socket listener: %s", exc
+            )
         logger.warning(
             "hermes-s2s: VoiceReceiver has no set_frame_callback; installed "
             "per-frame shim via monkey-patched _on_packet (see ADR-0007)."
@@ -604,6 +656,53 @@ def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
                 )
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("hermes-s2s: restore _voice_input_callback failed: %s", exc)
+
+        # Restore the original socket listener on the VoiceReceiver. We swapped
+        # it during _install_frame_callback; if we leave the wrapper in place
+        # after the bridge is gone, packets keep flowing through a wrapper
+        # whose frame-callback is dangling. Best-effort — receiver may already
+        # be torn down.
+        try:
+            receivers = getattr(self, "_voice_receivers", None) or {}
+            receiver = None
+            if guild_id is not None:
+                receiver = receivers.get(guild_id)
+            if receiver is None and len(receivers) == 1:
+                # Same single-guild fallback as the bridge lookup above.
+                receiver = next(iter(receivers.values()))
+            if receiver is not None:
+                wrapper = getattr(receiver, "_hermes_s2s_socket_listener", None)
+                orig_on_packet = getattr(
+                    receiver, "_hermes_s2s_original_on_packet", None
+                )
+                vc = getattr(receiver, "_vc", None)
+                conn = getattr(vc, "_connection", None) if vc is not None else None
+                if conn is not None and wrapper is not None:
+                    try:
+                        conn.remove_socket_listener(wrapper)
+                    except Exception:  # pragma: no cover — defensive
+                        pass
+                    if callable(orig_on_packet):
+                        try:
+                            conn.add_socket_listener(orig_on_packet)
+                        except Exception:  # pragma: no cover — defensive
+                            pass
+                # Drop our markers/refs so a future attach starts clean.
+                for attr in (
+                    "_hermes_s2s_socket_listener",
+                    "_hermes_s2s_original_on_packet",
+                    "_hermes_s2s_frame_cb",
+                    _FRAME_CB_INSTALLED_MARKER,
+                ):
+                    try:
+                        if hasattr(receiver, attr):
+                            delattr(receiver, attr)
+                    except Exception:  # pragma: no cover — defensive
+                        pass
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(
+                "hermes-s2s: socket-listener restoration failed: %s", exc
+            )
 
         return await original(self, *args, **kwargs)
 
