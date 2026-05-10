@@ -1,0 +1,475 @@
+"""Plugin-owned Discord ``/s2s`` slash command + per-channel mode override store.
+
+Implements WAVE 2a / M2.1 of the 0.4.0 re-architecture (Discord-only; Telegram
+and CLI scopes deferred to 0.4.1). See:
+
+- docs/adrs/0011-plugin-owned-s2s-command.md (full ADR)
+- docs/research/13-mode-ux-deep-dive.md §4 (the exact command pattern)
+- docs/plans/wave-0.4.0-rearchitecture.md WAVE 2a (A3 cross-process + A4 flock
+  acceptance criteria)
+
+The store persists to ``<HERMES_HOME>/.s2s_mode_overrides.json`` as a flat
+``{"guild_id:channel_id": mode_value}`` map. Writes go through a
+temp-file+atomic-rename path with an ``fcntl.flock(LOCK_EX)`` wrapper so
+concurrent writes from multiple processes (or many threads in one process)
+can't corrupt the file — Phase-8 security P1-F8.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import logging
+import os
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any, Optional
+
+from .modes import VoiceMode
+
+
+logger = logging.getLogger(__name__)
+
+
+# Sentinel attribute set on the Discord adapter (or its bot) after the
+# slash command has been installed. Keeps install_s2s_command idempotent
+# across repeated register() calls — which is expected in the Hermes
+# plugin reload path.
+_S2S_COMMAND_INSTALLED = "__hermes_s2s_command_installed__"
+
+_OVERRIDES_FILENAME = ".s2s_mode_overrides.json"
+
+
+# ---------------------------------------------------------------------------
+# S2SModeOverrideStore
+# ---------------------------------------------------------------------------
+
+
+def _default_store_path() -> Path:
+    """Resolve ``<HERMES_HOME>/.s2s_mode_overrides.json``.
+
+    Falls back to ``~/.hermes/.s2s_mode_overrides.json`` when
+    ``hermes_constants`` is unavailable (e.g. standalone plugin installs
+    during local dev). Honors ``HERMES_HOME`` via ``hermes_constants``
+    which reads the env var.
+    """
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        return Path(get_hermes_home()) / _OVERRIDES_FILENAME
+    except Exception:  # pragma: no cover - defensive
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        return Path(home) / _OVERRIDES_FILENAME
+
+
+class S2SModeOverrideStore:
+    """Persistent per-(guild_id, channel_id) voice-mode override store.
+
+    The store is deliberately simple: a JSON file on disk, lazy-loaded on
+    first access, flushed atomically after every ``set``/``clear`` with
+    an OS-level exclusive file lock. The in-memory cache is refreshed
+    on demand via :meth:`reload` — callers that need cross-process
+    consistency should call :meth:`reload` before :meth:`get` in hot
+    paths (the voice-join flow does this once per join — cost is
+    negligible).
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._path = Path(path) if path is not None else _default_store_path()
+        # In-process lock guards the cache dict + the file-writing section.
+        # File-level locking (flock) is additive, for cross-process safety.
+        self._lock = threading.Lock()
+        self._cache: dict[str, str] = {}
+        self._loaded = False
+
+    # --- helpers --------------------------------------------------------
+
+    @staticmethod
+    def _key(guild_id: int, channel_id: int) -> str:
+        return f"{int(guild_id)}:{int(channel_id)}"
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._load_locked()
+
+    def _load_locked(self) -> None:
+        """Populate ``self._cache`` from disk; tolerate missing/corrupt file."""
+        try:
+            with self._path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                # Coerce all values to strings; drop any non-dict entries.
+                self._cache = {
+                    str(k): str(v) for k, v in data.items() if v is not None
+                }
+            else:
+                logger.warning(
+                    "hermes-s2s: override store at %s is not a dict; ignoring",
+                    self._path,
+                )
+                self._cache = {}
+        except FileNotFoundError:
+            self._cache = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "hermes-s2s: failed to load override store %s (%s); "
+                "starting with empty map",
+                self._path,
+                exc,
+            )
+            self._cache = {}
+        self._loaded = True
+
+    def reload(self) -> None:
+        """Force re-read from disk (useful across process boundaries)."""
+        with self._lock:
+            self._loaded = False
+            self._load_locked()
+
+    # --- public API -----------------------------------------------------
+
+    def get(self, guild_id: int, channel_id: int) -> str | None:
+        with self._lock:
+            self._ensure_loaded()
+            return self._cache.get(self._key(guild_id, channel_id))
+
+    def set(self, guild_id: int, channel_id: int, mode: str) -> None:
+        """Persist ``mode`` for ``(guild_id, channel_id)``.
+
+        ``mode`` is normalized via :meth:`VoiceMode.normalize` so aliases
+        like ``"s2s_server"`` land on disk as canonical ``"s2s-server"``.
+        """
+        canonical = VoiceMode.normalize(mode).value
+        with self._lock:
+            self._ensure_loaded()
+            # Re-read from disk under flock so we don't clobber a write
+            # from a concurrent process between our load and our write.
+            merged = dict(self._cache)
+            merged[self._key(guild_id, channel_id)] = canonical
+            self._write_atomic(merged)
+            self._cache = merged
+
+    def clear(self, guild_id: int, channel_id: int) -> None:
+        with self._lock:
+            self._ensure_loaded()
+            merged = dict(self._cache)
+            merged.pop(self._key(guild_id, channel_id), None)
+            self._write_atomic(merged)
+            self._cache = merged
+
+    # --- atomic, flock-protected write ---------------------------------
+
+    def _write_atomic(self, payload: dict[str, str]) -> None:
+        """Serialize ``payload`` → temp → fsync → os.replace, under flock.
+
+        Strategy:
+
+        1. ``mkdir -p`` the parent.
+        2. Open (or create) a sibling ``.lock`` file and ``flock(LOCK_EX)``
+           it — this blocks other processes doing the same.
+        3. Re-load the file from disk INSIDE the lock and merge our
+           payload on top, so we don't lose entries written by another
+           process between our pre-flock read and the write.
+        4. Write the merged dict to a NamedTemporaryFile in the same
+           directory, ``flush()`` + ``fsync()``, then ``os.replace``
+           over the real path (atomic on POSIX + modern NTFS).
+        5. Release the flock.
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        # Open with O_CREAT so the lock file always exists; keep the fd
+        # open for the whole critical section.
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                # Merge with whatever is on disk right now (another process
+                # may have written between our last cache load and this
+                # write). We still keep our just-set entries on top.
+                disk: dict[str, str] = {}
+                try:
+                    with self._path.open("r", encoding="utf-8") as fh:
+                        loaded = json.load(fh)
+                    if isinstance(loaded, dict):
+                        disk = {
+                            str(k): str(v) for k, v in loaded.items() if v is not None
+                        }
+                except (FileNotFoundError, OSError, json.JSONDecodeError):
+                    disk = {}
+                # Our in-memory payload wins per key (we want set/clear
+                # to stick) but we preserve keys the other process added.
+                final = dict(disk)
+                final.update(payload)
+                # For clear(): if a key is missing from ``payload`` AND
+                # missing from our previous cache snapshot, respect the
+                # other process's value (keep it). Since ``payload`` here
+                # IS the post-op snapshot of OUR view, anything in
+                # ``self._cache`` but not in ``payload`` was a clear().
+                cleared_keys = set(self._cache.keys()) - set(payload.keys())
+                for k in cleared_keys:
+                    final.pop(k, None)
+
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=str(self._path.parent),
+                    prefix=self._path.name + ".",
+                    suffix=".tmp",
+                    delete=False,
+                )
+                try:
+                    json.dump(final, tmp, indent=2, sort_keys=True)
+                    tmp.flush()
+                    try:
+                        os.fsync(tmp.fileno())
+                    except OSError:  # pragma: no cover - e.g. tmpfs
+                        pass
+                    tmp.close()
+                    os.replace(tmp.name, self._path)
+                except Exception:
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                    raise
+                # Mirror the merged result back into our cache so
+                # subsequent get() calls see a consistent view.
+                self._cache = final
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Discord /s2s slash command installer
+# ---------------------------------------------------------------------------
+
+
+# Process-wide singleton so the slash handler and the factory see the same
+# in-memory cache. Constructed lazily to honor any late HERMES_HOME override.
+_store_singleton: Optional[S2SModeOverrideStore] = None
+_store_singleton_lock = threading.Lock()
+
+
+def get_default_store() -> S2SModeOverrideStore:
+    """Return the process-wide :class:`S2SModeOverrideStore`.
+
+    Used by both the slash-command handler and the voice factory so they
+    agree on the set of per-channel overrides without having to pass the
+    store around through every call site.
+    """
+    global _store_singleton
+    with _store_singleton_lock:
+        if _store_singleton is None:
+            _store_singleton = S2SModeOverrideStore()
+        return _store_singleton
+
+
+def _find_discord_tree(ctx: Any) -> Any | None:
+    """Best-effort walk to a ``discord.app_commands.CommandTree`` instance.
+
+    The Hermes adapter exposes its :class:`discord.Client` as ``self._client``
+    and the slash tree as ``self._client.tree``. Plugin contexts don't hand
+    us the adapter directly, so we probe a few common attribute paths.
+    Returns ``None`` if no tree can be found — the caller then logs and
+    no-ops (the slash won't appear until a restart on an uninstrumented
+    gateway).
+    """
+    candidates = []
+    # Direct ctx.tree (hypothetical future hook)
+    candidates.append(getattr(ctx, "tree", None))
+    # ctx.bot.tree (some plugin interfaces)
+    bot = getattr(ctx, "bot", None)
+    candidates.append(getattr(bot, "tree", None) if bot is not None else None)
+    # ctx.adapter / ctx.discord_adapter
+    for name in ("adapter", "discord_adapter", "platform"):
+        adapter = getattr(ctx, name, None)
+        if adapter is None:
+            continue
+        candidates.append(getattr(adapter, "tree", None))
+        client = getattr(adapter, "_client", None) or getattr(adapter, "client", None)
+        if client is not None:
+            candidates.append(getattr(client, "tree", None))
+    # ctx.runner.adapters[*]._client.tree (full gateway path)
+    runner = getattr(ctx, "runner", None)
+    adapters = getattr(runner, "adapters", None) if runner is not None else None
+    if isinstance(adapters, dict):
+        for ad in adapters.values():
+            client = getattr(ad, "_client", None) or getattr(ad, "client", None)
+            if client is not None:
+                candidates.append(getattr(client, "tree", None))
+
+    for cand in candidates:
+        if cand is None:
+            continue
+        # Duck-typing check: a CommandTree exposes .add_command / .sync / .commands
+        if callable(getattr(cand, "add_command", None)) and callable(
+            getattr(cand, "sync", None)
+        ):
+            return cand
+    return None
+
+
+def _tree_already_synced(tree: Any) -> bool:
+    """Heuristic: did the adapter already call ``tree.sync()``?
+
+    The Hermes discord adapter sets a private marker
+    ``self._slash_commands_synced`` on the client in its
+    ``_register_slash_commands`` path. We also probe a generic
+    ``_synced``/``__hermes_s2s_tree_synced__`` sentinel so tests can
+    inject the state directly.
+    """
+    client = getattr(tree, "client", None)
+    for obj in (tree, client):
+        if obj is None:
+            continue
+        for attr in (
+            "__hermes_s2s_tree_synced__",
+            "_slash_commands_synced",
+            "_synced",
+        ):
+            if getattr(obj, attr, False):
+                return True
+    return False
+
+
+def install_s2s_command(ctx: Any) -> bool:
+    """Register the plugin-owned ``/s2s`` slash command on the Discord tree.
+
+    Idempotent: repeated calls on the same context are no-ops after the
+    first successful install.
+
+    Returns ``True`` if the command was newly installed, ``False`` otherwise
+    (already installed, tree unavailable, or discord.py missing). Never
+    raises — the caller wraps it in try/except regardless.
+    """
+    try:
+        import discord  # type: ignore
+        from discord import app_commands  # type: ignore
+    except ImportError:
+        logger.info(
+            "hermes-s2s: discord.py not importable; skipping /s2s install"
+        )
+        return False
+
+    tree = _find_discord_tree(ctx)
+    if tree is None:
+        logger.info(
+            "hermes-s2s: no Discord CommandTree reachable from ctx; "
+            "/s2s slash will not be registered"
+        )
+        return False
+
+    # Idempotency sentinel on the TREE, not just ctx — ctx may be a
+    # transient wrapper handed to register() on every reload.
+    if getattr(tree, _S2S_COMMAND_INSTALLED, False):
+        logger.debug("hermes-s2s: /s2s already installed on this tree")
+        return False
+
+    store = get_default_store()
+
+    # discord.py's _extract_parameters_from_callback evaluates annotation
+    # strings against ``callback.__globals__`` — the module-level globals
+    # of this file, NOT the function's closure. Because we import
+    # ``discord`` + ``app_commands`` lazily inside this function to stay
+    # importable in test environments without discord.py, we temporarily
+    # inject them into this module's globals so the @app_commands.command
+    # decorator can resolve ``Interaction`` and ``Choice[str]`` from the
+    # callback's annotations.
+    _mod_globals = globals()
+    _mod_globals.setdefault("discord", discord)
+    _mod_globals.setdefault("app_commands", app_commands)
+    Choice = app_commands.Choice  # noqa: N806 — for readability in annotation
+    Interaction = discord.Interaction  # noqa: N806
+    _mod_globals.setdefault("Choice", Choice)
+    _mod_globals.setdefault("Interaction", Interaction)
+
+    @app_commands.command(
+        name="s2s",
+        description="Set the voice mode for the next /voice join",
+    )
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(
+                name="Cascaded (default Hermes voice)", value="cascaded"
+            ),
+            app_commands.Choice(
+                name="Pipeline (custom STT+TTS)", value="pipeline"
+            ),
+            app_commands.Choice(
+                name="Realtime (Gemini Live / GPT-4o)", value="realtime"
+            ),
+            app_commands.Choice(
+                name="External S2S server", value="s2s-server"
+            ),
+        ]
+    )
+    async def s2s_command(  # type: ignore[no-untyped-def]
+        interaction: Interaction,
+        mode: Choice[str],
+    ):
+        guild = getattr(interaction, "guild", None)
+        channel = getattr(interaction, "channel", None)
+        guild_id = getattr(guild, "id", None)
+        channel_id = getattr(channel, "id", None)
+        if guild_id is None or channel_id is None:
+            await interaction.response.send_message(
+                "❌ `/s2s` must be used inside a guild text channel.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            canonical = VoiceMode.normalize(mode.value)
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"❌ Unknown mode `{mode.value}`: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            store.set(int(guild_id), int(channel_id), canonical.value)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("hermes-s2s: /s2s store.set failed: %s", exc)
+            await interaction.response.send_message(
+                "❌ Couldn't save the override (see gateway logs).",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ Next /voice join in this channel will use **{mode.name}**.",
+            ephemeral=True,
+        )
+
+    try:
+        tree.add_command(s2s_command)
+    except Exception as exc:
+        logger.warning("hermes-s2s: tree.add_command(/s2s) failed: %s", exc)
+        return False
+
+    setattr(tree, _S2S_COMMAND_INSTALLED, True)
+
+    if _tree_already_synced(tree):
+        logger.warning(
+            "hermes-s2s: /s2s registered AFTER tree.sync(); the command "
+            "will only appear in Discord after the bot restarts. If you "
+            "need it immediately, call `await tree.sync()` again."
+        )
+    else:
+        logger.info(
+            "hermes-s2s: /s2s slash command registered on the Discord tree"
+        )
+    return True
+
+
+__all__ = [
+    "S2SModeOverrideStore",
+    "get_default_store",
+    "install_s2s_command",
+]
