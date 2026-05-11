@@ -699,7 +699,25 @@ def _install_bridge_on_adapter(adapter: Any, channel: Any, ctx: Any = None) -> N
     adapter-side lookup (``adapter._voice_clients[guild_id]`` + optional
     ``adapter._voice_receivers[guild_id]``). Kept separate so the real work
     in ``_attach_realtime_to_voice_client`` is trivially testable in isolation.
+
+    Side-effect: also (re-)installs the ``/s2s`` slash command on the
+    adapter's now-live Discord tree. Register-time install in
+    :func:`hermes_s2s.register` can race against bot login and miss the
+    tree; this fallback runs every join so the command always lands
+    eventually. Idempotent — once the tree carries our sentinel, the
+    install is a cheap no-op.
     """
+    # Slash install — opportunistic, runs first because it's cheap.
+    try:
+        from ..voice.slash import install_s2s_command_on_adapter
+
+        install_s2s_command_on_adapter(adapter)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "hermes-s2s: late /s2s slash install failed (voice still works): %s",
+            exc,
+        )
+
     guild = getattr(channel, "guild", None)
     guild_id = getattr(guild, "id", None)
     voice_clients = getattr(adapter, "_voice_clients", {}) or {}
@@ -767,7 +785,19 @@ def _attach_realtime_to_voice_client(
         return
 
     try:
-        cfg = load_config()
+        # v0.5.0 Wave 1: route through resolve_s2s_config_for_channel so any
+        # per-channel provider overrides written via the rich /s2s UI flow
+        # into ``cfg`` here. Mode-only overrides keep working via the
+        # ``channel_overrides`` fold below — same record, two consumers.
+        from ..voice.factory import resolve_s2s_config_for_channel
+
+        _guild = getattr(voice_client, "guild", None)
+        _gid = getattr(_guild, "id", None)
+        _channel = getattr(voice_client, "channel", None)
+        _cid = getattr(_channel, "id", None)
+        cfg = resolve_s2s_config_for_channel(
+            guild_id=_gid, channel_id=_cid
+        )
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning("hermes-s2s: s2s config load failed: %s", exc)
         return
