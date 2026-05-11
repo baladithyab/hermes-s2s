@@ -939,10 +939,105 @@ def install_s2s_command(ctx: Any) -> bool:
     return True
 
 
+def install_s2s_command_on_adapter(adapter: Any) -> bool:
+    """Install ``/s2s`` against a LIVE :class:`DiscordAdapter` instance.
+
+    Use this from inside a wrapped adapter method (e.g. the
+    ``join_voice_channel`` monkey-patch) — at that point the adapter's
+    ``_client.tree`` is fully constructed AND the bot is logged in,
+    which is the seam ``register(ctx)`` cannot safely target (the
+    register-time ``ctx.runner.adapters[...]._client.tree`` walk hits
+    ``None`` because the bot hasn't connected yet).
+
+    Idempotent — repeated calls on the same tree are no-ops.
+
+    If the tree was already synced when we add the command, this
+    function schedules an ``await tree.sync()`` on the bot's running
+    loop so Discord's UI actually picks up the new command without
+    requiring a bot restart. Without that re-sync, the existing
+    fingerprint-skip path in ``gateway/platforms/discord.py`` blocks
+    the implicit re-sync and ``/s2s`` never appears in the slash
+    autocomplete (verified on hermes-s2s 0.5.0 against the live
+    Hermes Discord adapter, 2026-05-11).
+
+    Returns True if the command was newly installed, False otherwise.
+    """
+    try:
+        import discord  # type: ignore
+        import asyncio
+    except ImportError:
+        return False
+
+    client = getattr(adapter, "_client", None) or getattr(adapter, "client", None)
+    if client is None:
+        logger.debug(
+            "hermes-s2s: install_s2s_command_on_adapter: adapter has no client"
+        )
+        return False
+    tree = getattr(client, "tree", None)
+    if tree is None:
+        logger.debug(
+            "hermes-s2s: install_s2s_command_on_adapter: client has no tree"
+        )
+        return False
+
+    # Reuse the existing register-time install path by feeding it a
+    # synthetic ctx that exposes the live tree directly.
+    class _LiveCtx:
+        def __init__(self, t: Any) -> None:
+            self.tree = t
+
+    was_already_synced = _tree_already_synced(tree)
+    installed = install_s2s_command(_LiveCtx(tree))
+    if not installed:
+        # Either already installed (idempotent no-op) or add_command
+        # failed; either way nothing more to do.
+        return False
+
+    # If the adapter already synced its own slash commands before
+    # we added /s2s, force a resync now so Discord's UI picks it up.
+    if was_already_synced:
+        loop = getattr(client, "loop", None)
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+        if loop is not None and not loop.is_closed():
+            async def _resync():
+                try:
+                    await tree.sync()
+                    logger.info(
+                        "hermes-s2s: forced tree.sync() after late /s2s "
+                        "install — Discord UI should refresh within ~30s"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "hermes-s2s: post-install tree.sync() failed: %s", exc
+                    )
+
+            try:
+                asyncio.run_coroutine_threadsafe(_resync(), loop)
+            except Exception as exc:
+                logger.warning(
+                    "hermes-s2s: could not schedule post-install tree.sync: %s",
+                    exc,
+                )
+        else:
+            logger.warning(
+                "hermes-s2s: /s2s installed but no live event loop "
+                "to schedule tree.sync() on; restart the bot to surface "
+                "the command in Discord"
+            )
+
+    return True
+
+
 __all__ = [
     "S2SModeOverrideStore",
     "get_default_store",
     "install_s2s_command",
+    "install_s2s_command_on_adapter",
 ]
 
 if _ui is not None:

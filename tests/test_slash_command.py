@@ -605,6 +605,55 @@ def test_install_creates_group_is_idempotent() -> None:
     assert tree.get_command("s2s") is not None
 
 
+def test_install_s2s_command_on_adapter_finds_live_tree() -> None:
+    """The adapter-path installer should find ``adapter._client.tree``.
+
+    Verifies the deferred-install seam used by the pre_gateway_dispatch
+    hook + the join_voice_channel monkey-patch — both pass a live
+    DiscordAdapter, NOT a register-time ctx that has no tree yet.
+    """
+    pytest.importorskip("discord")
+    import discord
+    from discord import app_commands
+    from hermes_s2s.voice.slash import (
+        install_s2s_command_on_adapter,
+        _S2S_COMMAND_INSTALLED,
+    )
+
+    intents = discord.Intents.none()
+    client = discord.Client(intents=intents)
+    tree = app_commands.CommandTree(client)
+    client.tree = tree  # type: ignore[attr-defined]
+
+    # Synthetic adapter shape mirroring DiscordAdapter._client
+    adapter = type("FakeAdapter", (), {"_client": client})()
+
+    installed = install_s2s_command_on_adapter(adapter)
+    assert installed is True
+    assert tree.get_command("s2s") is not None
+    assert getattr(tree, _S2S_COMMAND_INSTALLED, False) is True
+
+    # Idempotent — second call no-ops because the sentinel is set
+    second = install_s2s_command_on_adapter(adapter)
+    assert second is False
+
+
+def test_install_s2s_command_on_adapter_no_client_returns_false() -> None:
+    """Adapter without _client / client should be a clean no-op."""
+    pytest.importorskip("discord")
+    from hermes_s2s.voice.slash import install_s2s_command_on_adapter
+
+    adapter_no_client = type("FA", (), {})()
+    assert install_s2s_command_on_adapter(adapter_no_client) is False
+
+    adapter_no_tree = type(
+        "FA",
+        (),
+        {"_client": type("C", (), {})()},
+    )()
+    assert install_s2s_command_on_adapter(adapter_no_tree) is False
+
+
 # --------------------------------------------------------------------------- #
 # Wave 4 / Task 4.1 — CLI /s2s subcommand router                              #
 # --------------------------------------------------------------------------- #

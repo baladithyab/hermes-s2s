@@ -21,7 +21,7 @@ from .registry import (
     resolve_tts,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __all__ = [
     "S2SConfig",
     "load_config",
@@ -149,5 +149,51 @@ def register(ctx: Any) -> None:
                 break
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Telegram /s2s install skipped: %s", exc)
+
+    # Deferred /s2s slash install — the register-time install path in
+    # install_discord_voice_bridge runs BEFORE the Discord bot has logged
+    # in, so ``ctx.runner.adapters["discord"]._client.tree`` returns None
+    # and the slash never lands. Wiring a one-shot pre_gateway_dispatch
+    # hook gives us a guaranteed point where:
+    #   - the gateway is fully up (we're processing an inbound message)
+    #   - all adapters are connected (Discord client.tree is live)
+    #   - the gateway runner is passed as a kwarg (gateway=...)
+    # Idempotent: install_s2s_command_on_adapter sets a sentinel on
+    # the tree, so subsequent dispatches are cheap no-ops.
+    try:
+        from .voice.slash import install_s2s_command_on_adapter
+
+        _slash_install_done = {"discord": False}
+
+        def _on_pre_gateway_dispatch(**kwargs):
+            if _slash_install_done["discord"]:
+                return None
+            gateway = kwargs.get("gateway")
+            if gateway is None:
+                return None
+            adapters = getattr(gateway, "adapters", {}) or {}
+            ad = adapters.get("discord") if isinstance(adapters, dict) else None
+            if ad is None:
+                return None
+            try:
+                installed = install_s2s_command_on_adapter(ad)
+                # Mark done if the install fired OR the tree already
+                # carries our sentinel — in both cases there's nothing
+                # more this hook can do, so stop probing on every msg.
+                _slash_install_done["discord"] = True
+                if installed:
+                    logger.info(
+                        "hermes-s2s: /s2s slash installed on first "
+                        "gateway-dispatch (deferred path)"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "hermes-s2s: deferred /s2s install failed: %s", exc
+                )
+            return None
+
+        ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("hermes-s2s: deferred slash hook registration skipped: %s", exc)
 
     logger.info("hermes-s2s plugin v%s registered", __version__)
