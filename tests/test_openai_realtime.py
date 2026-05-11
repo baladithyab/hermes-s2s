@@ -231,7 +231,9 @@ async def test_session_cap_close_surfaces_error_and_reconnect_works(mock_ws_serv
 
     err_ev = await _drain_until(
         backend.recv_events(),
-        lambda ev: ev.type == "error" and ev.payload.get("reason") == "session_cap",
+        # 0.4.2 audit-#10: session_cap is now its own event type
+        # (was bundled into 'error' before).
+        lambda ev: ev.type == "session_cap" and ev.payload.get("reason") == "session_cap",
         timeout=3.0,
     )
     assert err_ev is not None

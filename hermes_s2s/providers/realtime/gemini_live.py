@@ -97,14 +97,30 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
         self._session_handle: Optional[str] = None
         self._last_setup: Optional[Dict[str, Any]] = None
         self._closed = False
+        # 0.4.2 (audit #6): initialise here so any code path touching
+        # recv_events before connect() doesn't AttributeError.
+        self._pending_first_msg: Optional[Dict[str, Any]] = None
+        # 0.4.2 S2: track whether we've injected history this session
+        # (used by reconnect path — sessionResumption skips re-injection).
+        self._history_injected: bool = False
 
     # ------------------------------------------------------------------ #
     # connect / close                                                    #
     # ------------------------------------------------------------------ #
-    async def connect(
-        self, system_prompt: str, voice: str, tools: List[Dict[str, Any]]
-    ) -> None:
-        """Open the WS and send the initial setup frame. Waits for setupComplete."""
+    async def _connect_with_opts(self, opts: "ConnectOptions") -> None:  # type: ignore[name-defined]
+        """Open the WS, send setup frame, optionally inject history.
+
+        Sequence:
+          1. Open WebSocket.
+          2. Send ``setup`` frame.
+          3. Wait for ``setupComplete``.
+          4. (NEW 0.4.2) If ``opts.history`` is non-empty AND we are NOT
+             reconnecting via session resumption, inject prior turns as
+             a single ``clientContent.turnComplete=true`` frame.
+          5. Set ``_history_injection_complete`` event so the input pump
+             can start sending live audio. Always set even on the
+             no-history path so audio isn't blocked.
+        """
         # Lazy-import websockets — part of [realtime] extra, not core deps.
         try:
             import websockets  # type: ignore
@@ -114,6 +130,14 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
                 "Install with: pip install 'hermes-s2s[realtime]'"
             ) from e
         self._connect_module = websockets
+
+        # 0.4.2: lazy-create the gating event in this loop (binding to
+        # the right loop matters when tests call connect from multiple
+        # loops across the suite).
+        if self._history_injection_complete is None:
+            self._history_injection_complete = asyncio.Event()
+        else:
+            self._history_injection_complete.clear()
 
         if self._url_override:
             url = self._url_override
@@ -127,9 +151,17 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
             url = GEMINI_LIVE_URL.format(api_key=api_key)
 
         self._ws = await websockets.connect(url, max_size=None)
-        self.voice = voice or self.voice
+        self.voice = opts.voice or self.voice
 
-        setup = self._build_setup(system_prompt, tools)
+        # Decide whether to inject persona suffix (only when history is
+        # non-empty — otherwise the suffix's "references to past tool calls"
+        # disclaimer just clutters fresh sessions).
+        history = list(opts.history or [])
+        has_history = bool(history)
+
+        setup = self._build_setup(
+            opts.system_prompt, opts.tools or [], with_history=has_history
+        )
         self._last_setup = setup
         await self._ws.send(json.dumps({"setup": setup}))
 
@@ -140,7 +172,7 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
             msg = json.loads(first)
             if "setupComplete" not in msg:
                 # Buffer this message so recv_events can re-yield it.
-                self._pending_first_msg: Optional[Dict[str, Any]] = msg
+                self._pending_first_msg = msg
             else:
                 self._pending_first_msg = None
         except asyncio.TimeoutError:
@@ -148,8 +180,78 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
         except Exception:  # noqa: BLE001 - fixtures may differ
             self._pending_first_msg = None
 
+        # 0.4.2 S2: inject history if present AND not reconnecting.
+        # On session resumption (handle present), Gemini retains
+        # server-side state — re-injecting turns the model already
+        # produced confuses the conversation.
+        if has_history and not self._session_handle:
+            try:
+                await self._send_history(history)
+                self._history_injected = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: history injection failed: %s; voice will start "
+                    "without text context",
+                    self.NAME,
+                    exc,
+                )
+
+        # Always release the gate so live audio can flow.
+        self._history_injection_complete.set()
+
+    async def _send_history(self, history: List[Dict[str, Any]]) -> None:
+        """Inject prior text-conversation turns as silent context.
+
+        Sends a single ``BidiGenerateContentClientContent`` frame with
+        role-mapped turns and ``turnComplete:true``. MUST be called
+        AFTER setupComplete and BEFORE the first realtimeInput.audio
+        frame (the input pump waits on ``_history_injection_complete``).
+
+        If the final turn is ``user``, append a synthetic ``model``
+        closer so Gemini stays silent (UX critique: text "(voice
+        session starting)" doubles as a pacing primer).
+        """
+        if self._ws is None:
+            return
+        gemini_turns: List[Dict[str, Any]] = []
+        for t in history:
+            role = "user" if t.get("role") == "user" else "model"
+            text = t.get("content")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            gemini_turns.append({"role": role, "parts": [{"text": text}]})
+        if not gemini_turns:
+            return
+        # Ensure final turn is role="model" so Gemini doesn't speak.
+        # Per UX critique §5: "(voice session starting)" reads as natural
+        # language not a keyword, and primes the model for terse voice replies.
+        if gemini_turns[-1]["role"] == "user":
+            gemini_turns.append(
+                {
+                    "role": "model",
+                    "parts": [{"text": "(voice session starting)"}],
+                }
+            )
+        msg = {
+            "clientContent": {
+                "turns": gemini_turns,
+                "turnComplete": True,
+            }
+        }
+        await self._ws.send(json.dumps(msg))
+        logger.info(
+            "%s: injected %d history turn(s) (~%d chars) before first audio",
+            self.NAME,
+            len(gemini_turns),
+            sum(len(t["parts"][0]["text"]) for t in gemini_turns),
+        )
+
     def _build_setup(
-        self, system_prompt: str, tools: List[Dict[str, Any]]
+        self,
+        system_prompt: str,
+        tools: List[Dict[str, Any]],
+        *,
+        with_history: bool = False,
     ) -> Dict[str, Any]:
         # Defense-in-depth language anchor — Gemini Live native-audio models
         # auto-detect output language from input audio cues, which can pin
@@ -189,6 +291,19 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
         }
         lang_name = _LANG_NAMES.get(lang_code, lang_code.upper())
         anchored = f"Respond exclusively in {lang_name}.\n\n{system_prompt}"
+        # 0.4.2 S2: when injecting prior text history, append a tool-disclaimer
+        # so the model treats prior tool-call references as completed work
+        # rather than promising to do them now (UX critique §4). Voice
+        # sessions today have no tools (tier system is v0.5.0), so any
+        # history reference to tools is by definition stale.
+        if with_history:
+            anchored += (
+                "\n\nIn this voice session you cannot call tools. "
+                "References in the prior conversation to tool calls or "
+                "actions you took describe completed work — treat them as "
+                "known facts, not ongoing tasks. "
+                "Keep replies short and conversational."
+            )
         setup: Dict[str, Any] = {
             "model": f"models/{self.model}" if "/" not in self.model else self.model,
             "generationConfig": {
