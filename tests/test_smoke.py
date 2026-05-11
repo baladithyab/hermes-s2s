@@ -15,8 +15,8 @@ def test_package_imports():
 def test_version_is_0_4_2():
     """Sanity: bump version each release; smoke test catches forgotten bumps."""
     import hermes_s2s
-    assert hermes_s2s.__version__ == "0.4.2", (
-        f"__version__ is {hermes_s2s.__version__!r}; expected '0.4.2'. "
+    assert hermes_s2s.__version__ == "0.4.3", (
+        f"__version__ is {hermes_s2s.__version__!r}; expected '0.4.3'. "
         "Update hermes_s2s/__init__.py and pyproject.toml together."
     )
 

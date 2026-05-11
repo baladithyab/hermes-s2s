@@ -883,21 +883,31 @@ def _attach_realtime_to_voice_client(
 
         # Find the thread we're attached to (set by ThreadResolver
         # earlier in the join flow; mirror table maintained on adapter).
+        # NOTE: ThreadResolver writes mirrors[guild_id] = (TranscriptMirror,
+        # thread_id) — a TUPLE. Earlier draft assumed dict shape; v0.4.2.1
+        # fix unpacks the tuple correctly.
         mirrors = getattr(adapter, "_s2s_transcript_mirrors", None) or {}
         thread_id = None
         if isinstance(mirrors, dict) and guild_id is not None:
             entry = mirrors.get(guild_id)
-            if isinstance(entry, dict):
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                thread_id = entry[1]  # (TranscriptMirror, thread_id)
+            elif isinstance(entry, dict):
                 thread_id = entry.get("thread_id") or entry.get("channel_id")
-            elif entry is not None:
-                thread_id = entry  # bare int
+            elif isinstance(entry, int):
+                thread_id = entry
+            # else: leave thread_id as None — log below
 
-        # Synthesize a user_id from the voice_client member if available;
-        # otherwise fall back to 0 (the session-key generator handles
-        # missing user_id by hashing remaining fields).
-        member = getattr(voice_client, "user_id", None)
-        if member is None:
-            member = getattr(getattr(voice_client, "member", None), "id", 0) or 0
+        # If mirror lookup didn't resolve a thread, fall back to the
+        # voice channel id itself — for joins from the home channel
+        # without ThreadResolver creating a thread.
+        if thread_id is None:
+            thread_id = channel_id
+            logger.debug(
+                "hermes-s2s: no transcript mirror thread_id; "
+                "falling back to voice channel id=%s",
+                thread_id,
+            )
 
         # Read the user's history config (typed envelope).
         # Ignore explosions — defaults are sensible.
@@ -912,10 +922,19 @@ def _attach_realtime_to_voice_client(
         if rt_cfg.history.enabled and thread_id is not None:
             session_db = get_or_create_adapter_session_db(adapter)
             if session_db is not None:
+                # NOTE on user_id: the gateway's session-key generator at
+                # gateway/session.py:738-744 honors group_sessions_per_user
+                # which defaults to True — but for Discord threads the
+                # observed live key is "...:thread:<thread_id>:<thread_id>"
+                # (the user_id slot mirrors the thread_id). Pass thread_id
+                # as user_id so resolve_session_id matches the live key.
+                # If a future Hermes version fixes this, our tier-2
+                # _entries lookup will still work because we're matching
+                # whatever generator is actually wired.
                 session_id = resolve_session_id_for_thread(
                     adapter,
                     thread_id=int(thread_id),
-                    user_id=int(member or 0),
+                    user_id=int(thread_id),  # see note above
                 )
                 if session_id:
                     history_payload = build_history_payload(
@@ -932,6 +951,18 @@ def _attach_realtime_to_voice_client(
                             session_id,
                             len(history_payload),
                         )
+                    else:
+                        logger.info(
+                            "hermes-s2s: history empty for session_id=%s "
+                            "(thread is fresh or all turns filtered)",
+                            session_id,
+                        )
+                else:
+                    logger.info(
+                        "hermes-s2s: no session_id resolved for "
+                        "thread_id=%s — voice will start fresh",
+                        thread_id,
+                    )
 
         # Stash on spec.options. The factory + RealtimeSession forward
         # this to backend.connect via ConnectOptions.history.
@@ -946,10 +977,14 @@ def _attach_realtime_to_voice_client(
             options=new_options,
         )
     except Exception as exc:  # noqa: BLE001 - history is best-effort
-        logger.debug(
+        # Promoted from debug to warning: silent debug-level swallow
+        # was the reason 0.4.2 first install showed no history. If
+        # this fires we want to see it in default-level logs.
+        logger.warning(
             "hermes-s2s: history fetch failed (%s); voice will start "
             "without text context",
             exc,
+            exc_info=True,
         )
 
     factory = VoiceSessionFactory(registry=registry_mod, tool_bridge=tool_bridge)

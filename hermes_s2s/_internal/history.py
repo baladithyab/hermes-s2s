@@ -239,20 +239,34 @@ def resolve_session_id_for_thread(
         )
         return None
 
-    # Build a synthetic SessionSource matching what the adapter would
-    # emit for a voice join in this thread. Use the thread id as the
-    # chat_id with chat_type='thread' (matching DiscordAdapter behavior
-    # — see gateway/platforms/discord.py for the canonical shape).
+    # Build a synthetic SessionSource matching what the Discord adapter
+    # would emit for a voice join in this thread. Discord builds
+    # ``chat_id=thread_id, thread_id=thread_id, chat_type="thread"``
+    # (see gateway/platforms/discord.py:3481-3488). For thread chat_type
+    # with thread_sessions_per_user=False (default), build_session_key
+    # at gateway/session.py:642-657 ignores user_id — so the key is
+    # ``agent:main:discord:thread:<thread_id>:<thread_id>``.
     try:
         from gateway.session import SessionSource  # type: ignore
 
+        try:
+            from gateway.types import Platform  # type: ignore
+        except ImportError:
+            from gateway.session import Platform  # type: ignore
+
         source = SessionSource(
-            platform=platform,
+            platform=Platform.DISCORD,
             chat_id=str(thread_id),
             chat_type="thread",
+            thread_id=str(thread_id),
             user_id=str(user_id),
+            user_name=str(user_id),
         )
         session_key = store._generate_session_key(source)  # noqa: SLF001
+        logger.debug(
+            "resolve_session_id_for_thread: synthesized session_key=%r",
+            session_key,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "resolve_session_id_for_thread: synthetic source/_generate_session_key "
