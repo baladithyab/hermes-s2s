@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .modes import VoiceMode
+from .slash_format import format_doctor_summary, format_status
 
 
 logger = logging.getLogger(__name__)
@@ -365,6 +366,34 @@ def get_default_store() -> S2SModeOverrideStore:
         return _store_singleton
 
 
+async def _require_guild_channel(interaction: Any) -> Optional[tuple[int, int]]:
+    """Return ``(guild_id, channel_id)`` or ``None`` after sending an error.
+
+    Subcommand callbacks use this to short-circuit cleanly when ``/s2s`` is
+    invoked from a DM or any non-guild-channel context. On failure it sends
+    an ephemeral error directly, so callers can just do::
+
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+    """
+    g = getattr(interaction, "guild", None)
+    c = getattr(interaction, "channel", None)
+    g_id = getattr(g, "id", None)
+    c_id = getattr(c, "id", None)
+    if g_id is None or c_id is None:
+        try:
+            await interaction.response.send_message(
+                "❌ `/s2s` must be used inside a guild text channel.",
+                ephemeral=True,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None
+    return int(g_id), int(c_id)
+
+
 def _find_discord_tree(ctx: Any) -> Any | None:
     """Best-effort walk to a ``discord.app_commands.CommandTree`` instance.
 
@@ -484,69 +513,191 @@ def install_s2s_command(ctx: Any) -> bool:
     _mod_globals.setdefault("Choice", Choice)
     _mod_globals.setdefault("Interaction", Interaction)
 
-    @app_commands.command(
+    # ------------------------------------------------------------------
+    # /s2s is a Group (Wave 2 / Task 2.2) with:
+    #   mode, status, provider, test, doctor, reset   ← this task
+    #   configure                                      ← Task 2.3
+    # ------------------------------------------------------------------
+    group = app_commands.Group(
         name="s2s",
-        description="Set the voice mode for the next /voice join",
+        description="Configure speech-to-speech voice",
     )
+
+    @group.command(name="mode", description="Set voice mode for this channel")
     @app_commands.choices(
         mode=[
-            app_commands.Choice(
-                name="Cascaded (default Hermes voice)", value="cascaded"
-            ),
-            app_commands.Choice(
-                name="Pipeline (custom STT+TTS)", value="pipeline"
-            ),
-            app_commands.Choice(
-                name="Realtime (Gemini Live / GPT-4o)", value="realtime"
-            ),
-            app_commands.Choice(
-                name="External S2S server", value="s2s-server"
-            ),
+            app_commands.Choice(name="Cascaded (default)", value="cascaded"),
+            app_commands.Choice(name="Pipeline (custom STT+TTS)", value="pipeline"),
+            app_commands.Choice(name="Realtime", value="realtime"),
+            app_commands.Choice(name="External S2S server", value="s2s-server"),
         ]
     )
-    async def s2s_command(  # type: ignore[no-untyped-def]
+    async def s2s_mode(  # type: ignore[no-untyped-def]
         interaction: Interaction,
         mode: Choice[str],
     ):
-        guild = getattr(interaction, "guild", None)
-        channel = getattr(interaction, "channel", None)
-        guild_id = getattr(guild, "id", None)
-        channel_id = getattr(channel, "id", None)
-        if guild_id is None or channel_id is None:
-            await interaction.response.send_message(
-                "❌ `/s2s` must be used inside a guild text channel.",
-                ephemeral=True,
-            )
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
             return
-
+        g, c = pair
         try:
             canonical = VoiceMode.normalize(mode.value)
         except ValueError as exc:
             await interaction.response.send_message(
-                f"❌ Unknown mode `{mode.value}`: {exc}",
-                ephemeral=True,
+                f"❌ Unknown mode `{mode.value}`: {exc}", ephemeral=True
             )
             return
-
         try:
-            store.set(int(guild_id), int(channel_id), canonical.value)
+            store.patch_record(g, c, mode=canonical.value)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("hermes-s2s: /s2s store.set failed: %s", exc)
+            logger.warning("hermes-s2s: /s2s mode patch_record failed: %s", exc)
             await interaction.response.send_message(
                 "❌ Couldn't save the override (see gateway logs).",
                 ephemeral=True,
             )
             return
-
         await interaction.response.send_message(
-            f"✅ Next /voice join in this channel will use **{mode.name}**.",
+            f"✅ This channel: mode → **{mode.name}**", ephemeral=True
+        )
+
+    @group.command(
+        name="status",
+        description="Show current S2S settings for this channel",
+    )
+    async def s2s_status_cmd(interaction: Interaction):  # type: ignore[no-untyped-def]
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        from ..tools import s2s_status as _status_tool
+        import json as _json
+
+        payload = _json.loads(_status_tool({}))
+        rec = store.get_record(g, c)
+        text = format_status(
+            active_mode=payload["active_mode"],
+            config_mode=payload["config_mode"],
+            realtime_provider=payload["realtime"]["provider"],
+            stt_provider=payload["cascaded"]["stt_provider"],
+            tts_provider=payload["cascaded"]["tts_provider"],
+            guild_id=g,
+            channel_id=c,
+            per_channel_record=rec,
+        )
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @group.command(
+        name="provider",
+        description="Override a single provider for this channel",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="Realtime backend", value="realtime"),
+            app_commands.Choice(name="STT (cascaded)", value="stt"),
+            app_commands.Choice(name="TTS (cascaded)", value="tts"),
+        ]
+    )
+    @app_commands.describe(
+        name="Provider name (see /s2s status for the available list)"
+    )
+    async def s2s_provider(  # type: ignore[no-untyped-def]
+        interaction: Interaction,
+        kind: Choice[str],
+        name: str,
+    ):
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        from ..registry import list_registered
+
+        field_map = {
+            "realtime": "realtime_provider",
+            "stt": "stt_provider",
+            "tts": "tts_provider",
+        }
+        field = field_map[kind.value]
+        available = list_registered().get(kind.value, [])
+        if name not in available:
+            listing = ", ".join(f"`{a}`" for a in available) or "_(none registered)_"
+            await interaction.response.send_message(
+                f"❌ Unknown {kind.value} provider `{name}`. Available: {listing}",
+                ephemeral=True,
+            )
+            return
+        try:
+            store.patch_record(g, c, **{field: name})
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: /s2s provider patch_record failed: %s", exc
+            )
+            await interaction.response.send_message(
+                "❌ Couldn't save the override (see gateway logs).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"✅ This channel: {kind.value} provider → **{name}**",
+            ephemeral=True,
+        )
+
+    @group.command(name="test", description="Run a TTS smoke test")
+    @app_commands.describe(text="Optional text to synthesise")
+    async def s2s_test(  # type: ignore[no-untyped-def]
+        interaction: Interaction,
+        text: str = "",
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from ..tools import s2s_test_pipeline
+        import json as _json
+
+        result = _json.loads(s2s_test_pipeline({"text": text or None}))
+        if result.get("ok"):
+            await interaction.followup.send(
+                f"✅ TTS OK — `{result.get('tts_provider')}` wrote "
+                f"{result.get('bytes')} bytes to `{result.get('wrote')}`",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ Smoke test failed at stage `{result.get('stage')}`: "
+                f"{result.get('error')}",
+                ephemeral=True,
+            )
+
+    @group.command(
+        name="doctor",
+        description="Run preflight checks (deps, keys, WS probe)",
+    )
+    async def s2s_doctor_cmd(interaction: Interaction):  # type: ignore[no-untyped-def]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from ..tools import s2s_doctor as _doctor
+        import json as _json
+
+        report_str = await _doctor({})
+        report = _json.loads(report_str)
+        summary = format_doctor_summary(report)
+        await interaction.followup.send(summary, ephemeral=True)
+
+    @group.command(
+        name="reset",
+        description="Clear all S2S overrides for this channel",
+    )
+    async def s2s_reset(interaction: Interaction):  # type: ignore[no-untyped-def]
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        store.set_record(g, c, {})
+        await interaction.response.send_message(
+            "✅ Cleared all S2S overrides for this channel — back to global config.",
             ephemeral=True,
         )
 
     try:
-        tree.add_command(s2s_command)
+        tree.add_command(group)
     except Exception as exc:
-        logger.warning("hermes-s2s: tree.add_command(/s2s) failed: %s", exc)
+        logger.warning("hermes-s2s: tree.add_command(/s2s group) failed: %s", exc)
         return False
 
     setattr(tree, _S2S_COMMAND_INSTALLED, True)
@@ -559,7 +710,7 @@ def install_s2s_command(ctx: Any) -> bool:
         )
     else:
         logger.info(
-            "hermes-s2s: /s2s slash command registered on the Discord tree"
+            "hermes-s2s: /s2s slash command group registered on the Discord tree"
         )
     return True
 

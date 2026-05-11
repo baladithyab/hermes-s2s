@@ -546,3 +546,60 @@ def test_doctor_summary_all_pass() -> None:
     assert "pass" in summary.lower()
     # No failure block when nothing failed
     assert "no failures" in summary.lower() or "all checks passed" in summary.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Wave 2 / Task 2.2 — /s2s is now an app_commands.Group with subcommands      #
+# --------------------------------------------------------------------------- #
+
+
+def test_install_creates_group_with_subcommands() -> None:
+    """The Discord tree should receive a Group named 's2s' with the expected
+    leaf subcommands: mode, status, provider, test, doctor, reset.
+
+    Uses a real ``discord.Client`` + ``app_commands.CommandTree`` so we
+    verify against the real ``tree.get_command`` / ``Group.commands``
+    public API, not a bespoke mock.
+    """
+    pytest.importorskip("discord")
+    import discord
+    from discord import app_commands
+
+    intents = discord.Intents.none()
+    client = discord.Client(intents=intents)
+    tree = app_commands.CommandTree(client)
+
+    ctx = MagicMock(spec=[])
+    ctx.tree = tree
+
+    installed = install_s2s_command(ctx)
+    assert installed is True
+
+    cmd = tree.get_command("s2s")
+    assert cmd is not None, "tree has no top-level 's2s' command after install"
+    # It must be a Group, not a leaf Command — duck-type via ``.commands``.
+    assert hasattr(cmd, "commands"), (
+        "top-level 's2s' is not a Group; expected app_commands.Group with subcommands"
+    )
+    sub_names = {c.name for c in cmd.commands}
+    assert {"mode", "status", "provider", "test", "doctor", "reset"} <= sub_names, (
+        f"missing subcommands; got {sub_names}"
+    )
+
+
+def test_install_creates_group_is_idempotent() -> None:
+    """Repeated install on the same tree still no-ops after the refactor."""
+    pytest.importorskip("discord")
+    import discord
+    from discord import app_commands
+
+    client = discord.Client(intents=discord.Intents.none())
+    tree = app_commands.CommandTree(client)
+    ctx = MagicMock(spec=[])
+    ctx.tree = tree
+
+    first = install_s2s_command(ctx)
+    second = install_s2s_command(ctx)
+    assert first is True
+    assert second is False
+    assert tree.get_command("s2s") is not None
