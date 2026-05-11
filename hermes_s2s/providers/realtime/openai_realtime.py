@@ -28,7 +28,7 @@ import logging
 import os
 from typing import Any, AsyncIterator, Dict, Optional
 
-from . import RealtimeEvent
+from . import RealtimeEvent, _BaseRealtimeBackend
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ _DEFAULT_VOICE = "alloy"
 _CONNECT_URL_TEMPLATE = "wss://api.openai.com/v1/realtime?model={model}"
 
 
-class OpenAIRealtimeBackend:
+class OpenAIRealtimeBackend(_BaseRealtimeBackend):
     """OpenAI Realtime duplex backend.
 
     Matches the ``RealtimeBackend`` Protocol declared in
@@ -55,6 +55,9 @@ class OpenAIRealtimeBackend:
         connect_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
+        # Call _BaseRealtimeBackend.__init__ to wire up
+        # _history_injection_complete event support.
+        super().__init__()
         self.api_key_env = api_key_env
         self.model = model
         self.voice = voice
@@ -65,6 +68,8 @@ class OpenAIRealtimeBackend:
         self._send_lock: Optional[asyncio.Lock] = None
         self._closed = False
         self._client_initiated_close = False
+        # 0.4.2 S2: track whether we've injected history this session.
+        self._history_injected: bool = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -92,10 +97,22 @@ class OpenAIRealtimeBackend:
 
     # --------------------------------------------------------------- Protocol
 
-    async def connect(
-        self, system_prompt: str, voice: str, tools: list[dict]
-    ) -> None:
-        """Open the WS, send session.update with voice/instructions/tools."""
+    async def _connect_with_opts(self, opts: "ConnectOptions") -> None:  # type: ignore[name-defined]
+        """Open the WS, send session.update, optionally inject history.
+
+        Sequence:
+          1. Open WebSocket.
+          2. Send ``session.update`` with voice/instructions/tools.
+          3. (NEW 0.4.2) If ``opts.history`` is non-empty AND not
+             reconnecting, emit one ``conversation.item.create`` per
+             prior turn. NO ``response.create`` tail — that would
+             trigger an unprompted reply.
+          4. Set ``_history_injection_complete`` so live audio can flow.
+
+        Note: ``send_audio_chunk`` awaits ``_history_injection_complete``
+        to prevent live user speech from interleaving into the history
+        sequence (red-team P0-7).
+        """
         # Lazy import so the package imports cleanly without websockets installed.
         try:
             import websockets  # type: ignore[import-not-found]
@@ -104,6 +121,12 @@ class OpenAIRealtimeBackend:
                 "OpenAIRealtimeBackend requires the 'websockets' package. "
                 "Install with: pip install websockets"
             ) from exc
+
+        # 0.4.2: lazy-create the gating event in this loop.
+        if self._history_injection_complete is None:
+            self._history_injection_complete = asyncio.Event()
+        else:
+            self._history_injection_complete.clear()
 
         url = self._build_connect_url()
         api_key = self._resolve_api_key()
@@ -123,20 +146,87 @@ class OpenAIRealtimeBackend:
         self._client_initiated_close = False
 
         # Voice override via connect() arg wins over constructor default.
-        effective_voice = voice or self.voice
+        effective_voice = opts.voice or self.voice
+        # 0.4.2 S2: append tool-disclaimer to instructions when injecting history.
+        instructions = opts.system_prompt
+        history = list(opts.history or [])
+        has_history = bool(history)
+        if has_history:
+            instructions = (
+                instructions
+                + "\n\nIn this voice session you cannot call tools. "
+                + "References in the prior conversation to tool calls or "
+                + "actions you took describe completed work — treat them as "
+                + "known facts, not ongoing tasks. "
+                + "Keep replies short and conversational."
+            )
         session_update = {
             "type": "session.update",
             "session": {
                 "model": self.model,
-                "instructions": system_prompt,
+                "instructions": instructions,
                 "voice": effective_voice,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "tools": tools or [],
+                "tools": opts.tools or [],
                 "tool_choice": "auto",
             },
         }
         await self._send_json(session_update)
+
+        # 0.4.2 S2: inject history.
+        if has_history:
+            try:
+                await self._send_history(history)
+                self._history_injected = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: history injection failed: %s; voice will start "
+                    "without text context",
+                    type(self).__name__,
+                    exc,
+                )
+
+        # Always release the gate so live audio can flow.
+        self._history_injection_complete.set()
+
+    async def _send_history(self, history: list[dict]) -> None:
+        """Inject prior text-conversation turns as silent context.
+
+        Emits one ``conversation.item.create`` per turn; the OpenAI
+        server appends each to its conversation state. Does NOT emit
+        ``response.create`` — that would make the model speak.
+
+        Roles map: ``user``→``user`` with ``input_text`` content;
+        ``assistant``→``assistant`` with ``text`` content. Other roles
+        skipped (filtered upstream by ``build_history_payload``).
+        """
+        for t in history:
+            role = t.get("role")
+            text = t.get("content")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if role == "user":
+                content_type = "input_text"
+            elif role == "assistant":
+                content_type = "text"
+            else:
+                continue
+            await self._send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": content_type, "text": text}],
+                    },
+                }
+            )
+        logger.info(
+            "%s: injected %d history turn(s) before first audio",
+            type(self).__name__,
+            len(history),
+        )
 
     async def send_audio_chunk(self, pcm_chunk: bytes, sample_rate: int) -> None:
         """Send PCM16 audio; resample to 24 kHz if needed.
@@ -144,7 +234,18 @@ class OpenAIRealtimeBackend:
         Resampling uses ``hermes_s2s.audio.resample`` (R1). If the module is
         not yet available and the caller supplies a non-24 kHz rate we raise
         with a helpful message.
+
+        0.4.2 S2 (red-team P0-7): if history injection is in flight,
+        block here until ``_history_injection_complete`` so live audio
+        doesn't interleave into the conversation.item.create sequence
+        and corrupt server-side conversation state.
         """
+        # Gate live audio behind history-injection completion. Event is
+        # set immediately on connect() if no history; only gates on the
+        # first chunk of a fresh session with non-empty history.
+        if self._history_injection_complete is not None:
+            await self._history_injection_complete.wait()
+
         if self._ws is None:
             raise RuntimeError("OpenAIRealtimeBackend: not connected")
 
@@ -253,8 +354,11 @@ class OpenAIRealtimeBackend:
                     "OpenAIRealtimeBackend: WS closed abnormally (likely 30-min cap): %s",
                     exc,
                 )
+                # 0.4.2 audit-#10: emit dedicated session_cap event type
+                # (was bundled into 'error' before — caller had to inspect
+                # payload reason). Now type-distinguishable for filters.
                 yield RealtimeEvent(
-                    type="error",
+                    type="session_cap",
                     payload={"reason": "session_cap", "detail": str(exc)},
                 )
 
@@ -265,8 +369,9 @@ class OpenAIRealtimeBackend:
             logger.info(
                 "OpenAIRealtimeBackend: WS closed cleanly by server (likely 30-min cap)"
             )
+            # 0.4.2 audit-#10: dedicated event type.
             yield RealtimeEvent(
-                type="error",
+                type="session_cap",
                 payload={
                     "reason": "session_cap",
                     "detail": "server closed WebSocket",

@@ -25,6 +25,8 @@ import queue
 import threading
 from typing import Any, Callable, Optional
 
+import numpy as np
+
 from hermes_s2s.audio.resample import resample_pcm
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,15 @@ class BridgeBuffer:
         self._next_drop_warn_at = self._dropped_input_warn_threshold
         self._frames_emitted = 0
         self._frames_underflow = 0
+        # 0.4.2 S1 Fix B: track silence-to-audio transitions for raised-cosine
+        # fade-in on the first non-silence frame after underflow. Eliminates
+        # the reply-onset pop reported by users. Fade ramp is precomputed so
+        # ``read_frame`` stays O(frame_size) on the hot path.
+        # silence_fade_ms can be 0 to disable; clamped 0-50 by AudioConfig.
+        self._last_was_silence: bool = True  # opening state: no audio yet
+        self._silence_fade_ms: int = 5  # config-driven; 0 disables
+        self._fade_envelope_int16: Optional[np.ndarray] = None
+        self._build_fade_envelope()
 
     # ---------------- input side (sync, thread-safe) ----------------
 
@@ -221,14 +232,97 @@ class BridgeBuffer:
 
         Returns the next queued frame, or 3840 bytes of silence on underflow.
         NEVER returns b"" — that would terminate playback per research/07.
+
+        0.4.2 S1 Fix B: applies a raised-cosine fade-in to the first
+        non-silence frame after a silence run, eliminating reply-onset
+        pops. Fade duration is configurable via AudioConfig.
         """
         with self._output_lock:
             if self._output_frames:
+                frame = self._output_frames.pop(0)
+                # Fade-in if this is the first non-silence frame after silence.
+                if self._last_was_silence and self._fade_envelope_int16 is not None:
+                    frame = self._apply_fade_in(frame)
+                self._last_was_silence = False
                 self._frames_emitted += 1
-                return self._output_frames.pop(0)
+                return frame
             self._underflows += 1
             self._frames_underflow += 1
+            self._last_was_silence = True
         return SILENCE_FRAME
+
+    # 0.4.2 S1 Fix B helpers ------------------------------------------- #
+
+    def clear_output(self) -> int:
+        """Drop all queued output frames + held remainder. Used on barge-in.
+
+        0.4.2 S3 (audit #21): when the user starts a new utterance,
+        any in-flight ARIA reply is being abandoned. Without this,
+        Discord plays out ~300ms of stale audio (the queued frames)
+        before the new reply starts — perceived as ARIA still talking
+        for a beat after the user interrupts.
+
+        Returns the number of frames dropped (for diagnostics).
+        """
+        with self._output_lock:
+            dropped = len(self._output_frames)
+            self._output_frames.clear()
+            self._output_remainder.clear()
+            self._output_drops += dropped
+            # After a clear, the buffer is logically silent again — so
+            # the next non-silence frame will get faded in (Fix B).
+            self._last_was_silence = True
+        return dropped
+
+    def _build_fade_envelope(self) -> None:
+        """Precompute raised-cosine fade-in ramp as int16 multipliers (Q15).
+
+        At 48kHz stereo, a 5ms fade = 240 stereo frames = 480 int16 samples.
+        Stored as a numpy array of length ``2 * fade_samples`` (interleaved
+        L/R) of float32 multipliers in [0, 1]. Applied per-sample in
+        ``_apply_fade_in``.
+
+        Set ``_silence_fade_ms = 0`` to disable (envelope set to None).
+        """
+        if self._silence_fade_ms <= 0:
+            self._fade_envelope_int16 = None
+            return
+        # 48kHz * fade_ms/1000 = samples per channel; * 2 channels interleaved
+        fade_samples_per_ch = int(48_000 * self._silence_fade_ms / 1000)
+        # Raised-cosine: 0.5 * (1 - cos(pi * t)) over t in [0, 1]
+        t = np.linspace(0.0, 1.0, fade_samples_per_ch, endpoint=False)
+        envelope = 0.5 * (1.0 - np.cos(np.pi * t)).astype(np.float32)
+        # Interleave for stereo: each per-channel sample maps to L,R
+        self._fade_envelope_int16 = np.repeat(envelope, 2)
+
+    def set_silence_fade_ms(self, fade_ms: int) -> None:
+        """Reconfigure fade-in length (called by bridge after AudioConfig load).
+
+        Clamps to [0, 50]; 0 disables fade-in entirely.
+        """
+        clamped = max(0, min(50, int(fade_ms)))
+        if clamped == self._silence_fade_ms:
+            return
+        with self._output_lock:
+            self._silence_fade_ms = clamped
+            self._build_fade_envelope()
+
+    def _apply_fade_in(self, frame: bytes) -> bytes:
+        """Apply precomputed raised-cosine fade to leading samples of frame.
+
+        Frame is 3840 bytes = 1920 int16 samples = 960 stereo samples.
+        Fade envelope length is ``min(envelope_len, 1920)`` int16 samples.
+        Samples beyond the envelope length are unchanged (full amplitude).
+        """
+        if self._fade_envelope_int16 is None:
+            return frame
+        env = self._fade_envelope_int16
+        arr = np.frombuffer(frame, dtype=np.int16).copy()
+        n = min(len(env), len(arr))
+        # Multiply leading samples by envelope; preserve int16 dtype.
+        leading = arr[:n].astype(np.float32) * env[:n]
+        arr[:n] = np.clip(leading, -32768, 32767).astype(np.int16)
+        return arr.tobytes()
 
     # ---------------- diagnostics ----------------
 
@@ -369,6 +463,30 @@ class RealtimeAudioBridge:
         # work (see voice.transcript.TranscriptMirror.schedule_send).
         self._transcript_sink: Optional[Callable[..., None]] = None
 
+        # 0.4.2 S1: streaming-resampler cache for output audio
+        # (backend rate -> Discord 48 kHz). Replaces stateless
+        # resample_pcm calls in _dispatch_event audio_chunk branch
+        # which produced audible chunk-boundary clicks at realistic
+        # variable-length Gemini Live chunks. See:
+        #   docs/research/17-audio-clicks-rootcause.md
+        #   docs/plans/wave-0.4.2-clicks-history-quickwins.md (S1)
+        # Reset on: stop(), reconnect, barge-in, activity_start. Cache
+        # is lazily populated; instances kept across reset() so we
+        # only allocate once per (in_rate, out_rate, channels) triple.
+        try:
+            from hermes_s2s.audio.streaming_resample import ResamplerCache
+
+            self._out_resampler_cache: Optional["ResamplerCache"] = ResamplerCache()
+        except ImportError:
+            # soxr not installed; fall back to stateless resample_pcm.
+            # Logged once to avoid heartbeat spam.
+            logger.warning(
+                "hermes-s2s: soxr not installed; using stateless resample "
+                "(audible chunk-boundary clicks expected). "
+                "Install with: pip install soxr"
+            )
+            self._out_resampler_cache = None
+
     # ---------------- public API ----------------
 
     async def start(self) -> None:
@@ -401,6 +519,9 @@ class RealtimeAudioBridge:
         self._closed = True
         if self._stop_event is not None:
             self._stop_event.set()
+        # 0.4.2 S1: drop streaming-resampler state on session end so a
+        # subsequent restart starts with fresh filter state.
+        self._reset_out_resamplers()
         # 0.4.2: if we're shutting down with an open activity, emit a final
         # activity_end so Gemini flushes the in-flight utterance instead of
         # holding it server-side. Best-effort; backend may already be torn
@@ -487,7 +608,33 @@ class RealtimeAudioBridge:
             )
         else:
             s["time_since_last_frame_s"] = None
+        # 0.4.2 S1: streaming resampler observability.
+        if self._out_resampler_cache is not None:
+            s["out_resamplers_cached"] = len(self._out_resampler_cache)
+        else:
+            s["out_resamplers_cached"] = -1  # soxr unavailable
+        # 0.4.2 audit-#42: surface history injection state so live verify
+        # ("did history actually load?") is objectively checkable via
+        # /s2s_status, not vibes-based.
+        history_injected = bool(getattr(self.backend, "_history_injected", False))
+        s["history_injected"] = history_injected
+        s["realtime_voice"] = getattr(self.backend, "voice", None)
+        s["realtime_model"] = getattr(self.backend, "model", None)
         return s
+
+    def _reset_out_resamplers(self) -> None:
+        """Reset all output streaming-resampler filter state.
+
+        Called when the audio stream is logically discontinuous:
+        ``close()``, barge-in, new user activity_start. Keeps the
+        cached instances around (they're cheap to reuse) but flushes
+        their internal FIR delay lines so the next chunk starts fresh.
+        """
+        if self._out_resampler_cache is not None:
+            try:
+                self._out_resampler_cache.clear()
+            except Exception:  # noqa: BLE001 - defensive
+                logger.exception("ResamplerCache.clear() failed")
 
     # ---------------- bridge loop ----------------
 
@@ -651,6 +798,23 @@ class RealtimeAudioBridge:
                     raise
                 except Exception:  # noqa: BLE001
                     logger.exception("backend.send_activity_start failed")
+                # 0.4.2 S1: new user utterance = abandon any in-flight
+                # ARIA output. Reset output resampler filter state so the
+                # next chunk doesn't start with stale FIR taps from the
+                # previous (now-cancelled) reply.
+                self._reset_out_resamplers()
+                # 0.4.2 S3 (audit #21): clear buffered output frames so
+                # the user doesn't hear ~300ms of stale ARIA audio after
+                # interrupting. Fade-in on next non-silence frame keeps
+                # the resumption clean (Fix B already wired).
+                dropped = self.buffer.clear_output()
+                if dropped > 0:
+                    logger.debug(
+                        "barge-in: dropped %d queued output frames "
+                        "(~%dms of stale audio)",
+                        dropped,
+                        dropped * 20,  # 20ms per frame at 48kHz stereo
+                    )
             self._last_input_frame_monotonic = _time.monotonic()
 
             try:
@@ -706,13 +870,34 @@ class RealtimeAudioBridge:
                 return
             rate = payload.get("sample_rate", self._backend_output_rate)
             try:
-                frame_pcm = resample_pcm(
-                    pcm,
-                    src_rate=rate,
-                    dst_rate=DISCORD_SAMPLE_RATE,
-                    src_channels=1,
-                    dst_channels=DISCORD_CHANNELS,
-                )
+                # 0.4.2 S1: prefer streaming resampler if soxr is available.
+                # Path: backend mono PCM s16le @ rate -> mono PCM s16le @ 48k
+                # -> stereo upmix (numpy.repeat). soxr is mono-channel for
+                # this stream (we don't waste CPU running stereo through
+                # the same filter twice).
+                if self._out_resampler_cache is not None:
+                    rs = self._out_resampler_cache.get(rate, DISCORD_SAMPLE_RATE, 1)
+                    mono_48k = rs.process(pcm)
+                    if not mono_48k:
+                        # Filter delay swallowed this chunk (first ~1ms of
+                        # stream). Will surface in next chunk; not a click.
+                        return
+                    # Upmix mono int16 -> stereo by interleaving each sample.
+                    # numpy.repeat with axis=0 (frames axis) duplicates the
+                    # frame, then reshape to interleave L/R = same.
+                    mono_arr = np.frombuffer(mono_48k, dtype=np.int16)
+                    stereo = np.repeat(mono_arr, 2)
+                    frame_pcm = stereo.tobytes()
+                else:
+                    # Fallback path: stateless resample_pcm. Logged once at
+                    # init when soxr is missing.
+                    frame_pcm = resample_pcm(
+                        pcm,
+                        src_rate=rate,
+                        dst_rate=DISCORD_SAMPLE_RATE,
+                        src_channels=1,
+                        dst_channels=DISCORD_CHANNELS,
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception("resample output failed")
                 return

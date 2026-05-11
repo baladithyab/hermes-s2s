@@ -343,6 +343,9 @@ class VoiceSessionFactory:
             voice = options.get("voice")
 
         tools = list(options.get("tools") or [])
+        # 0.4.2 S2: thread history through to the session so it can pass
+        # to backend.connect() via ConnectOptions. Empty list = no history.
+        history = list(options.get("history") or [])
 
         # Eagerly construct RealtimeAudioBridge if the backend is
         # available. The M1.9 attach glue reads ``session._bridge`` to
@@ -382,6 +385,7 @@ class VoiceSessionFactory:
                 "system_prompt": system_prompt,
                 "voice": voice,
                 "tools": tools,
+                "history": history,  # 0.4.2 S2
             },
         )
 
@@ -392,6 +396,7 @@ class VoiceSessionFactory:
             system_prompt=system_prompt,
             voice=voice,
             tools=tools,
+            history=history,  # 0.4.2 S2
             bridge=bridge,
         )
 

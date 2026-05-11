@@ -179,6 +179,10 @@ def test_push_output_slices_with_remainder_hold() -> None:
     with no remaining remainder.
     """
     buf = BridgeBuffer()
+    # 0.4.2 S1 Fix B: fade-in mutates leading samples of the FIRST frame
+    # after silence. Disable fade for this byte-equality test which is
+    # really testing remainder-slicing semantics, not fade behaviour.
+    buf.set_silence_fade_ms(0)
     chunk_a = b"\xaa" * (FRAME_BYTES * 2 + FRAME_BYTES // 2)  # 2.5 frames
     added = buf.push_output(chunk_a)
     assert added == 2
@@ -301,6 +305,10 @@ def test_bridge_slices_250ms_chunk_into_12_frames_and_holds_remainder() -> None:
             input_rate=16000, output_rate=16000, events=events
         )
         bridge = RealtimeAudioBridge(backend=backend)
+        # 0.4.2 S1: this test mocks resample_pcm to verify slicing/remainder
+        # semantics. Force the legacy stateless path by clearing the soxr
+        # cache; the mock will then run.
+        bridge._out_resampler_cache = None  # noqa: SLF001
 
         def fake_resample(pcm: bytes, **kwargs: Any) -> bytes:
             # Only the backend->Discord direction gets the big 8000 B blob.

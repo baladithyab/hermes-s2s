@@ -867,6 +867,91 @@ def _attach_realtime_to_voice_client(
     #       nested-config unwrap behavior;
     #     - eagerly constructs a RealtimeAudioBridge so we can reach
     #       session._bridge below for frame-callback / PCM-source wiring.
+
+    # 0.4.2 S2: fetch prior thread history so the realtime session has
+    # context. Best-effort — voice still boots if history fetch fails.
+    # This MUST run before factory.build so spec.options["history"] is
+    # available when RealtimeSession._on_start passes ConnectOptions to
+    # the backend. See research/18 + plan-v2 §S2.
+    try:
+        from ..config.realtime_config import RealtimeConfig
+        from .history import (
+            build_history_payload,
+            get_or_create_adapter_session_db,
+            resolve_session_id_for_thread,
+        )
+
+        # Find the thread we're attached to (set by ThreadResolver
+        # earlier in the join flow; mirror table maintained on adapter).
+        mirrors = getattr(adapter, "_s2s_transcript_mirrors", None) or {}
+        thread_id = None
+        if isinstance(mirrors, dict) and guild_id is not None:
+            entry = mirrors.get(guild_id)
+            if isinstance(entry, dict):
+                thread_id = entry.get("thread_id") or entry.get("channel_id")
+            elif entry is not None:
+                thread_id = entry  # bare int
+
+        # Synthesize a user_id from the voice_client member if available;
+        # otherwise fall back to 0 (the session-key generator handles
+        # missing user_id by hashing remaining fields).
+        member = getattr(voice_client, "user_id", None)
+        if member is None:
+            member = getattr(getattr(voice_client, "member", None), "id", 0) or 0
+
+        # Read the user's history config (typed envelope).
+        # Ignore explosions — defaults are sensible.
+        try:
+            rt_cfg = RealtimeConfig.from_full_config(
+                {"s2s": {"voice": {"realtime": getattr(cfg, "voice_realtime", {}) or {}}}}
+            )
+        except Exception:  # noqa: BLE001
+            rt_cfg = RealtimeConfig()
+
+        history_payload: list = []
+        if rt_cfg.history.enabled and thread_id is not None:
+            session_db = get_or_create_adapter_session_db(adapter)
+            if session_db is not None:
+                session_id = resolve_session_id_for_thread(
+                    adapter,
+                    thread_id=int(thread_id),
+                    user_id=int(member or 0),
+                )
+                if session_id:
+                    history_payload = build_history_payload(
+                        session_db,
+                        session_id,
+                        max_turns=rt_cfg.history.max_turns,
+                        max_tokens=rt_cfg.history.max_tokens,
+                    )
+                    if history_payload:
+                        logger.info(
+                            "hermes-s2s: realtime history loaded — "
+                            "thread_id=%s session_id=%s turns=%d",
+                            thread_id,
+                            session_id,
+                            len(history_payload),
+                        )
+
+        # Stash on spec.options. The factory + RealtimeSession forward
+        # this to backend.connect via ConnectOptions.history.
+        new_options = dict(getattr(spec, "options", {}) or {})
+        new_options["history"] = history_payload
+        # ModeSpec is a dataclass; rebuild with merged options.
+        from ..voice.modes import ModeSpec  # local import — circular safe
+
+        spec = ModeSpec(
+            mode=spec.mode,
+            provider=spec.provider,
+            options=new_options,
+        )
+    except Exception as exc:  # noqa: BLE001 - history is best-effort
+        logger.debug(
+            "hermes-s2s: history fetch failed (%s); voice will start "
+            "without text context",
+            exc,
+        )
+
     factory = VoiceSessionFactory(registry=registry_mod, tool_bridge=tool_bridge)
     # CapabilityError intentionally propagates to the outer wrapper.
     session = factory.build(spec, voice_client, adapter, ctx)

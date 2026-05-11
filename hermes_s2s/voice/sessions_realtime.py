@@ -91,6 +91,7 @@ class RealtimeSession(AsyncExitStackBaseSession):
         system_prompt: Optional[str] = None,
         voice: Optional[str] = None,
         tools: Optional[list] = None,
+        history: Optional[list] = None,  # 0.4.2 S2
         bridge: Any = None,
         **_ignored: Any,
     ) -> None:
@@ -108,6 +109,11 @@ class RealtimeSession(AsyncExitStackBaseSession):
         self._voice = voice if voice is not None else options.get("voice")
         self._tools = list(
             tools if tools is not None else options.get("tools") or []
+        )
+        # 0.4.2 S2: history is best-effort — empty list is the no-op default.
+        # Forwarded to backend via ConnectOptions in _on_start.
+        self._history = list(
+            history if history is not None else options.get("history") or []
         )
 
         # ``bridge`` is injectable for tests that don't need a real
@@ -157,10 +163,19 @@ class RealtimeSession(AsyncExitStackBaseSession):
         #    this await returns. If connect raises, we never spawn
         #    pumps, and _exit_stack.aclose() unwinds any callbacks
         #    already registered (there are none at this point).
-        logger.debug("realtime session: awaiting backend.connect()")
-        await self._backend.connect(
-            self._system_prompt, self._voice, self._tools
+        # 0.4.2 S2: pass ConnectOptions so backend gets history.
+        # _BaseRealtimeBackend.connect() shim accepts both ConnectOptions
+        # AND the legacy positional triple — we use dataclass form.
+        from hermes_s2s.voice.connect_options import ConnectOptions
+
+        opts = ConnectOptions(
+            system_prompt=self._system_prompt,
+            voice=self._voice or "",
+            tools=list(self._tools),
+            history=self._history if self._history else None,
         )
+        logger.debug("realtime session: awaiting backend.connect()")
+        await self._backend.connect(opts)
         logger.debug("realtime session: backend.connect() returned")
 
         # 3. THEN spawn input and output pump tasks. Register them

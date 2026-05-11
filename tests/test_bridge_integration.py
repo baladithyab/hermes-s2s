@@ -192,20 +192,35 @@ def test_backpressure_under_load() -> None:
 
 
 def test_backend_audio_chunks_get_resampled_to_48k_stereo() -> None:
-    """Script a 24 k mono PCM chunk; assert read_frame yields 48 k stereo s16le
+    """Script TWO 24 k mono PCM chunks; assert read_frame yields 48 k stereo s16le
     frames of exactly 3840 B (= 20 ms). Plan wording says ``float32``, but the
     bridge dispatches PCM as s16le bytes per the protocol; we test the
-    rate+channel-upconversion which is the substantive integration concern."""
+    rate+channel-upconversion which is the substantive integration concern.
+
+    0.4.2 S1: switched from stateless resample_pcm to streaming
+    soxr.ResampleStream. The streaming resampler buffers ~1480 output
+    samples of filter delay on each stream, so the FIRST chunk emits
+    fewer frames than the stateless path did. Subsequent chunks emit
+    those buffered samples + new content. Test with two chunks to
+    exercise both transient and steady-state behaviour.
+    """
 
     async def scenario() -> None:
-        # 100 ms @ 24 k mono s16le = 2400 samples * 2 B = 4800 B.
-        # After resample: 24k->48k (x2), mono->stereo (x2) = 19_200 B = 5 frames.
+        # Two 100 ms @ 24 k mono s16le chunks = 4800 B each.
+        # Theoretical output per chunk: 24k->48k (x2) + mono->stereo (x2)
+        # = 19_200 B = 5 frames stateless. Streaming buffers ~6 frames
+        # of delay on first chunk, so ≥7 total across both chunks is
+        # the steady-state lower bound.
         backend_chunk = (b"\x33\x44") * 2400  # 4800 B
         events = [
             RealtimeEvent(
                 type="audio_chunk",
                 payload={"pcm": backend_chunk, "sample_rate": 24000},
-            )
+            ),
+            RealtimeEvent(
+                type="audio_chunk",
+                payload={"pcm": backend_chunk, "sample_rate": 24000},
+            ),
         ]
         backend = FakeBackend(scripted_events=events)
         bridge = RealtimeAudioBridge(backend=backend)
@@ -213,15 +228,18 @@ def test_backend_audio_chunks_get_resampled_to_48k_stereo() -> None:
         try:
             for _ in range(60):
                 await asyncio.sleep(0.01)
-                if bridge.buffer.queued_output_frames >= 5:
+                if bridge.buffer.queued_output_frames >= 7:
                     break
             queued = bridge.buffer.queued_output_frames
         finally:
             backend._shutdown.set()
             await bridge.close()
 
-        assert queued >= 4, (
-            f"expected ~5 frames from a 100 ms 24 k chunk resampled to 48 k "
+        # Two 100ms chunks => ~10 frames total stateless; ~7-9 streaming
+        # depending on filter delay. Lower bound 7 catches regressions
+        # without flapping on soxr quality-mode tweaks.
+        assert queued >= 7, (
+            f"expected ≥7 frames from two 100 ms 24 k chunks resampled to 48 k "
             f"stereo; got {queued}"
         )
         # Every frame returned from read_frame must be exactly 3840 B.
