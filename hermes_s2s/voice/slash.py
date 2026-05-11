@@ -366,6 +366,201 @@ def get_default_store() -> S2SModeOverrideStore:
         return _store_singleton
 
 
+# ---------------------------------------------------------------------------
+# S2SConfigureView — rich /s2s configure panel (Wave 2 / Task 2.3)
+# ---------------------------------------------------------------------------
+#
+# The View subclasses ``discord.ui.View`` so discord.py MUST be importable
+# at class-definition time. We do a top-level try-import and let
+# ``S2SConfigureView`` remain undefined when discord.py is absent — tests
+# ``pytest.importorskip("discord")`` before importing the symbol.
+try:  # pragma: no cover - import-time guard
+    import discord as _discord_mod  # type: ignore
+    from discord import ui as _ui  # type: ignore
+except ImportError:  # pragma: no cover - environment-dependent
+    _discord_mod = None  # type: ignore[assignment]
+    _ui = None  # type: ignore[assignment]
+
+
+if _ui is not None:
+
+    class S2SConfigureView(_ui.View):  # type: ignore[misc, valid-type]
+        """Rich configuration panel for ``/s2s configure``.
+
+        Lifetime: 5 minutes (default View timeout); on timeout the
+        controls disable themselves but the message stays as a summary.
+
+        Components
+        ----------
+        - Mode select (4 canonical modes).
+        - Per-kind provider select for every kind with at least one
+          registered provider. Options are ``[:25]`` sliced because
+          Discord caps a Select at 25 options.
+        - Three buttons: Test pipeline / Reset overrides / Refresh status.
+
+        Every select and button patches the override store via the same
+        ``S2SModeOverrideStore`` used by the direct ``/s2s mode`` and
+        ``/s2s provider`` subcommands so the two surfaces can't drift.
+        """
+
+        def __init__(
+            self,
+            *,
+            guild_id: int,
+            channel_id: int,
+            store: "S2SModeOverrideStore",
+        ) -> None:
+            super().__init__(timeout=300.0)
+            self._g = int(guild_id)
+            self._c = int(channel_id)
+            self._store = store
+            # Build options dynamically from the live registry so e.g. a
+            # plugin-registered TTS provider shows up in the picker on
+            # next /s2s configure.
+            from ..registry import list_registered
+
+            reg = list_registered()
+            self._add_mode_select()
+            self._add_provider_select("realtime", list(reg.get("realtime", [])))
+            self._add_provider_select("stt", list(reg.get("stt", [])))
+            self._add_provider_select("tts", list(reg.get("tts", [])))
+
+        # ----- select builders -----------------------------------------
+
+        def _add_mode_select(self) -> None:
+            opts = [
+                _discord_mod.SelectOption(label="Cascaded (default)", value="cascaded"),
+                _discord_mod.SelectOption(label="Pipeline (custom)", value="pipeline"),
+                _discord_mod.SelectOption(label="Realtime", value="realtime"),
+                _discord_mod.SelectOption(label="External server", value="s2s-server"),
+            ]
+            sel = _ui.Select(
+                placeholder="Pick a mode…",
+                options=opts,
+                min_values=1,
+                max_values=1,
+                custom_id="s2s_mode",
+            )
+
+            async def _cb(interaction: Any) -> None:
+                values = getattr(sel, "values", None) or []
+                if not values:
+                    data = getattr(interaction, "data", {}) or {}
+                    values = data.get("values") or []
+                if not values:
+                    return
+                v = values[0]
+                self._store.patch_record(self._g, self._c, mode=v)
+                await interaction.response.send_message(
+                    f"Mode → `{v}`", ephemeral=True
+                )
+
+            sel.callback = _cb  # type: ignore[assignment]
+            self.add_item(sel)
+
+        def _add_provider_select(self, kind: str, names: list[str]) -> None:
+            if not names:
+                return  # No registered providers of this kind — skip the row
+            # Discord caps a Select at 25 options — respect it.
+            opts = [
+                _discord_mod.SelectOption(label=n, value=n) for n in names[:25]
+            ]
+            placeholder = {
+                "realtime": "Pick realtime backend…",
+                "stt": "Pick STT provider…",
+                "tts": "Pick TTS provider…",
+            }.get(kind, f"Pick {kind}…")
+            field = f"{kind}_provider"
+            sel = _ui.Select(
+                placeholder=placeholder,
+                options=opts,
+                min_values=1,
+                max_values=1,
+                custom_id=f"s2s_{kind}",
+            )
+
+            async def _cb(interaction: Any) -> None:
+                values = getattr(sel, "values", None) or []
+                if not values:
+                    data = getattr(interaction, "data", {}) or {}
+                    values = data.get("values") or []
+                if not values:
+                    return
+                v = values[0]
+                self._store.patch_record(self._g, self._c, **{field: v})
+                await interaction.response.send_message(
+                    f"{kind.upper()} provider → `{v}`", ephemeral=True
+                )
+
+            sel.callback = _cb  # type: ignore[assignment]
+            self.add_item(sel)
+
+        # ----- buttons -------------------------------------------------
+
+        @_ui.button(  # type: ignore[misc]
+            label="Test pipeline",
+            style=_discord_mod.ButtonStyle.primary,
+            custom_id="s2s_test",
+        )
+        async def _test_btn(self, interaction: Any, _button: Any) -> None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            from ..tools import s2s_test_pipeline
+
+            r = json.loads(s2s_test_pipeline({}))
+            if r.get("ok"):
+                await interaction.followup.send(
+                    f"✅ TTS OK — wrote {r.get('bytes')} bytes via "
+                    f"`{r.get('tts_provider')}`",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ Test failed at `{r.get('stage')}`: {r.get('error')}",
+                    ephemeral=True,
+                )
+
+        @_ui.button(  # type: ignore[misc]
+            label="Reset overrides",
+            style=_discord_mod.ButtonStyle.danger,
+            custom_id="s2s_reset",
+        )
+        async def _reset_btn(self, interaction: Any, _button: Any) -> None:
+            self._store.set_record(self._g, self._c, {})
+            await interaction.response.send_message(
+                "✅ Cleared this channel's overrides.", ephemeral=True
+            )
+
+        @_ui.button(  # type: ignore[misc]
+            label="Refresh status",
+            style=_discord_mod.ButtonStyle.secondary,
+            custom_id="s2s_refresh",
+        )
+        async def _refresh_btn(self, interaction: Any, _button: Any) -> None:
+            from ..tools import s2s_status as _stat
+
+            payload = json.loads(_stat({}))
+            rec = self._store.get_record(self._g, self._c)
+            text = format_status(
+                active_mode=payload["active_mode"],
+                config_mode=payload["config_mode"],
+                realtime_provider=payload["realtime"]["provider"],
+                stt_provider=payload["cascaded"]["stt_provider"],
+                tts_provider=payload["cascaded"]["tts_provider"],
+                guild_id=self._g,
+                channel_id=self._c,
+                per_channel_record=rec,
+            )
+            await interaction.response.edit_message(content=text, view=self)
+
+        async def on_timeout(self) -> None:
+            """Disable every control once the view expires (5 min)."""
+            for child in self.children:
+                try:
+                    child.disabled = True  # type: ignore[attr-defined]
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+
 async def _require_guild_channel(interaction: Any) -> Optional[tuple[int, int]]:
     """Return ``(guild_id, channel_id)`` or ``None`` after sending an error.
 
@@ -694,6 +889,35 @@ def install_s2s_command(ctx: Any) -> bool:
             ephemeral=True,
         )
 
+    @group.command(
+        name="configure",
+        description="Open interactive S2S configuration panel",
+    )
+    async def s2s_configure(interaction: Interaction):  # type: ignore[no-untyped-def]
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        from ..tools import s2s_status as _stat
+        import json as _json
+
+        payload = _json.loads(_stat({}))
+        rec = store.get_record(g, c)
+        text = format_status(
+            active_mode=payload["active_mode"],
+            config_mode=payload["config_mode"],
+            realtime_provider=payload["realtime"]["provider"],
+            stt_provider=payload["cascaded"]["stt_provider"],
+            tts_provider=payload["cascaded"]["tts_provider"],
+            guild_id=g,
+            channel_id=c,
+            per_channel_record=rec,
+        )
+        view = S2SConfigureView(guild_id=g, channel_id=c, store=store)
+        await interaction.response.send_message(
+            text, view=view, ephemeral=True
+        )
+
     try:
         tree.add_command(group)
     except Exception as exc:
@@ -720,3 +944,6 @@ __all__ = [
     "get_default_store",
     "install_s2s_command",
 ]
+
+if _ui is not None:
+    __all__.append("S2SConfigureView")
