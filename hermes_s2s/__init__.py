@@ -21,7 +21,7 @@ from .registry import (
     resolve_tts,
 )
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 __all__ = [
     "S2SConfig",
     "load_config",
@@ -177,19 +177,37 @@ def register(ctx: Any) -> None:
                 return None
             try:
                 installed = install_s2s_command_on_adapter(ad)
-                # Mark done if the install fired OR the tree already
-                # carries our sentinel — in both cases there's nothing
-                # more this hook can do, so stop probing on every msg.
-                _slash_install_done["discord"] = True
-                if installed:
-                    logger.info(
-                        "hermes-s2s: /s2s slash installed on first "
-                        "gateway-dispatch (deferred path)"
-                    )
             except Exception as exc:
                 logger.warning(
                     "hermes-s2s: deferred /s2s install failed: %s", exc
                 )
+                return None
+            # Mark done ONLY when:
+            #   - the install actually fired this dispatch (installed=True), OR
+            #   - the tree already carries our sentinel (a previous dispatch
+            #     or the bridge-side path landed it).
+            # Returning False from install_s2s_command_on_adapter when the
+            # adapter has no live client/tree must NOT short-circuit future
+            # dispatches; otherwise users whose first inbound message races
+            # bot login never get /s2s. (Codex review PR #2.)
+            if installed:
+                _slash_install_done["discord"] = True
+                logger.info(
+                    "hermes-s2s: /s2s slash installed on first "
+                    "gateway-dispatch (deferred path)"
+                )
+                return None
+            # Probe whether some other path already installed it.
+            try:
+                from .voice.slash import _S2S_COMMAND_INSTALLED
+
+                client = getattr(ad, "_client", None) or getattr(ad, "client", None)
+                tree = getattr(client, "tree", None) if client is not None else None
+                if tree is not None and getattr(tree, _S2S_COMMAND_INSTALLED, False):
+                    _slash_install_done["discord"] = True
+            except Exception:
+                # Sentinel probe failures are non-fatal — keep retrying.
+                pass
             return None
 
         ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)

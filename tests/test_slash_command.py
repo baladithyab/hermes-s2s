@@ -655,6 +655,96 @@ def test_install_s2s_command_on_adapter_no_client_returns_false() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Codex PR #1 P1 — patch_record must be atomic (read-modify-write under lock) #
+# --------------------------------------------------------------------------- #
+
+
+def test_patch_record_concurrent_different_fields_dont_lose_writes(tmp_path) -> None:
+    """Two threads patching different fields on the same channel must
+    both land — ``patch_record`` releases the lock between read and
+    write in the broken implementation, so the slower writer's snapshot
+    of the record predates the fast writer's write and clobbers it.
+
+    This test pins the contract by having two threads patch
+    ``mode`` and ``realtime_provider`` in tight loops; the final record
+    must contain BOTH keys regardless of interleaving.
+    """
+    import threading
+
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    g, c = 1, 2
+    iterations = 50
+
+    def _set_mode():
+        for _ in range(iterations):
+            store.patch_record(g, c, mode="realtime")
+
+    def _set_provider():
+        for _ in range(iterations):
+            store.patch_record(g, c, realtime_provider="gpt-realtime-mini")
+
+    t1 = threading.Thread(target=_set_mode)
+    t2 = threading.Thread(target=_set_provider)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    final = store.get_record(g, c)
+    assert final.get("mode") == "realtime", f"mode lost: {final!r}"
+    assert final.get("realtime_provider") == "gpt-realtime-mini", \
+        f"realtime_provider lost: {final!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Codex PR #1 P2 — formatter must show effective per-channel values           #
+# --------------------------------------------------------------------------- #
+
+
+def test_format_status_shows_per_channel_provider_override() -> None:
+    """When the override record sets ``realtime_provider``, the status
+    line for "Realtime provider" must show the override, NOT the
+    global config's value."""
+    from hermes_s2s.voice.slash_format import format_status
+
+    out = format_status(
+        active_mode="realtime",
+        config_mode="cascaded",
+        realtime_provider="gpt-realtime-2",  # global
+        stt_provider="moonshine",
+        tts_provider="kokoro",
+        guild_id=1,
+        channel_id=2,
+        per_channel_record={"realtime_provider": "gpt-realtime-mini"},  # override
+    )
+    assert "gpt-realtime-mini" in out, (
+        f"effective realtime override not shown:\n{out}"
+    )
+    # The global value MUST NOT appear in the realtime line
+    assert "Realtime provider: `gpt-realtime-2`" not in out, (
+        f"status formatter still rendering global value over override:\n{out}"
+    )
+    # Must mark the line so users can tell it's overridden
+    assert "(channel override)" in out
+
+
+def test_format_status_uses_global_when_no_override() -> None:
+    """No override → globals shown unmarked."""
+    from hermes_s2s.voice.slash_format import format_status
+
+    out = format_status(
+        active_mode="cascaded",
+        config_mode="cascaded",
+        realtime_provider="gpt-realtime-2",
+        stt_provider="moonshine",
+        tts_provider="kokoro",
+        guild_id=1,
+        channel_id=2,
+        per_channel_record={},
+    )
+    assert "gpt-realtime-2" in out
+    assert "(channel override)" not in out
+
+
+# --------------------------------------------------------------------------- #
 # Wave 4 / Task 4.1 — CLI /s2s subcommand router                              #
 # --------------------------------------------------------------------------- #
 

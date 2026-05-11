@@ -38,20 +38,46 @@ def format_status(
     ``per_channel_record`` is the dict the override store returned for this
     ``(guild_id, channel_id)`` — empty means "no channel override, using
     the global config".
+
+    When a record key is set (e.g. ``per_channel_record["realtime_provider"]
+    == "gpt-realtime-mini"``) it WINS over the corresponding global value
+    in the rendered output — so the status line shows the *effective*
+    provider this channel will use, not the global config's value. This
+    matches the resolved ``S2SConfig`` produced by
+    :func:`hermes_s2s.voice.factory.resolve_s2s_config_for_channel`.
+    Without this, users who set per-channel overrides see the panel
+    contradicting itself: "Realtime provider: <global>" alongside
+    "Channel overrides set: realtime_provider". (Codex review PR #1.)
     """
     has_override = bool(per_channel_record)
+    # Effective values fold in any per-channel overrides on top of globals.
+    eff_mode = str(per_channel_record.get("mode") or active_mode)
+    eff_realtime = str(per_channel_record.get("realtime_provider") or realtime_provider)
+    eff_stt = str(per_channel_record.get("stt_provider") or stt_provider)
+    eff_tts = str(per_channel_record.get("tts_provider") or tts_provider)
+
     header = f"**S2S status — guild `{guild_id}` channel `{channel_id}`**"
-    mode_line = f"  • Active mode: `{active_mode}`"
-    if has_override:
+    mode_line = f"  • Active mode: `{eff_mode}`"
+    if has_override and "mode" in per_channel_record:
         mode_line += f" (this channel overrides global `{config_mode}`)"
+    elif has_override:
+        # Channel has provider overrides but mode is still global.
+        mode_line += " (global default)"
     else:
         mode_line += " (global default)"
+
+    def _provider_line(label: str, eff: str, key: str) -> str:
+        line = f"  • {label}: `{eff}`"
+        if key in per_channel_record:
+            line += " _(channel override)_"
+        return line
+
     lines = [
         header,
         mode_line,
-        f"  • Realtime provider: `{realtime_provider}`",
-        f"  • Cascaded STT: `{stt_provider}`",
-        f"  • Cascaded TTS: `{tts_provider}`",
+        _provider_line("Realtime provider", eff_realtime, "realtime_provider"),
+        _provider_line("Cascaded STT", eff_stt, "stt_provider"),
+        _provider_line("Cascaded TTS", eff_tts, "tts_provider"),
     ]
     if not has_override:
         lines.append("  • _no channel override — using global config_")

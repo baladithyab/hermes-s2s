@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-s2s"
-version = "0.5.1"
+version = "0.5.2"
 description = "Configurable speech-to-speech for Hermes Agent — realtime, cascaded, and local-pipeline backends."
 readme = "README.md"
 requires-python = ">=3.11"

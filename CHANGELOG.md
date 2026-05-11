@@ -4,6 +4,42 @@ All notable changes to `hermes-s2s` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-05-11
+
+### Fixed (Codex review follow-ups for PR #1 + PR #2)
+
+- **P1 — `S2SModeOverrideStore.patch_record` is now atomic across
+  read-modify-write.** The 0.5.0 implementation released the
+  in-process lock between reading the existing record and writing
+  the merged result, so two near-simultaneous `patch_record` calls on
+  different fields (mode + provider tap, common with the rich UI)
+  could clobber each other's writes. The merge now happens inside the
+  same `self._lock` critical section that calls `_set_locked` (which
+  in turn does the flock-protected file write). New regression test
+  spawns two threads doing 50 patches each on different fields and
+  asserts both fields land. (Codex PR #1.)
+- **P2 — `format_status` now shows the *effective* per-channel
+  values, not the global config's.** Previously the rendered status
+  block could read "Realtime provider: gpt-realtime-2 / Channel
+  overrides set: realtime_provider" — a self-contradiction. The
+  formatter folds the override record on top of the global values
+  before rendering, and tags overridden lines with `(channel override)`
+  so users can tell at a glance which lines came from `config.yaml`
+  vs the per-channel store. (Codex PR #1.)
+- **P1 — Deferred slash-install hook keeps retrying until install
+  actually succeeds.** The 0.5.1 implementation set
+  `_slash_install_done["discord"] = True` even when
+  `install_s2s_command_on_adapter()` returned `False` (no live client
+  yet), so a first-message-before-bot-login race permanently disabled
+  the retry path. The hook now only marks itself done when the
+  install fired OR the tree carries the install sentinel — meaning a
+  later dispatch (when the tree is finally live) can still land the
+  command. (Codex PR #2.)
+
+### Tests
+- 368 passed (was 365 → +3). New regression tests pin all three
+  contracts above.
+
 ## [0.5.1] — 2026-05-11
 
 ### Fixed

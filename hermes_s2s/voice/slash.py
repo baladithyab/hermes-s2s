@@ -184,6 +184,36 @@ class S2SModeOverrideStore:
         disk as canonical values; an unparseable mode is dropped (other
         keys preserved) rather than failing the write.
         """
+        cleaned = self._clean_record(record)
+        with self._lock:
+            self._ensure_loaded()
+            self._set_locked(guild_id, channel_id, cleaned)
+
+    def patch_record(
+        self, guild_id: int, channel_id: int, **fields: str
+    ) -> Dict[str, str]:
+        """Merge ``fields`` into the existing record; return the new record.
+
+        The read-modify-write happens entirely under the in-process lock
+        AND the file-level flock (via ``_set_locked`` → ``_write_atomic``)
+        so two near-simultaneous patches on different fields cannot drop
+        each other's writes. This is the contract the rich Discord/Telegram
+        UI relies on — users tap mode + provider buttons in quick
+        succession and expect both to land. (Codex review PR #1.)
+        """
+        cleaned = self._clean_record(dict(fields))
+        with self._lock:
+            self._ensure_loaded()
+            existing = dict(self._cache.get(self._key(guild_id, channel_id), {}))
+            existing.update(cleaned)
+            self._set_locked(guild_id, channel_id, existing)
+            return existing
+
+    # --- internal: assumes self._lock is HELD by caller ---------------
+
+    @staticmethod
+    def _clean_record(record: Dict[str, str]) -> Dict[str, str]:
+        """Coerce + normalize a record's keys/values; drop empties + bad modes."""
         cleaned = {
             str(k): str(v) for k, v in (record or {}).items() if v not in (None, "")
         }
@@ -192,32 +222,19 @@ class S2SModeOverrideStore:
                 cleaned["mode"] = VoiceMode.normalize(cleaned["mode"]).value
             except ValueError:
                 cleaned.pop("mode", None)
-        with self._lock:
-            self._ensure_loaded()
-            merged = dict(self._cache)
-            if cleaned:
-                merged[self._key(guild_id, channel_id)] = cleaned
-            else:
-                merged.pop(self._key(guild_id, channel_id), None)
-            self._write_atomic(merged)
-            self._cache = merged
+        return cleaned
 
-    def patch_record(
-        self, guild_id: int, channel_id: int, **fields: str
-    ) -> Dict[str, str]:
-        """Merge ``fields`` into the existing record; return the new record."""
-        with self._lock:
-            self._ensure_loaded()
-            existing = dict(self._cache.get(self._key(guild_id, channel_id), {}))
-        cleaned = {k: v for k, v in fields.items() if v not in (None, "")}
-        if "mode" in cleaned:
-            try:
-                cleaned["mode"] = VoiceMode.normalize(cleaned["mode"]).value
-            except ValueError:
-                cleaned.pop("mode", None)
-        existing.update({str(k): str(v) for k, v in cleaned.items()})
-        self.set_record(guild_id, channel_id, existing)
-        return existing
+    def _set_locked(
+        self, guild_id: int, channel_id: int, cleaned: Dict[str, str]
+    ) -> None:
+        """Write `cleaned` to (guild, channel) — assumes self._lock is held."""
+        merged = dict(self._cache)
+        if cleaned:
+            merged[self._key(guild_id, channel_id)] = cleaned
+        else:
+            merged.pop(self._key(guild_id, channel_id), None)
+        self._write_atomic(merged)
+        self._cache = merged
 
     # --- public API: back-compat shims (legacy mode-only callers) ------
 
