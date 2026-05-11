@@ -442,3 +442,107 @@ def test_legacy_get_method_still_works_after_dict_upgrade(tmp_path: Path) -> Non
     store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
     store.set_record(123, 456, {"mode": "s2s-server", "stt_provider": "groq"})
     assert store.get(123, 456) == "s2s-server"
+
+
+# --------------------------------------------------------------------------- #
+# Wave 2 / Task 2.1 — pure-text formatters (slash_format)                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_status_formatter_renders_active_mode_and_providers() -> None:
+    from hermes_s2s.voice.slash_format import format_status
+
+    out = format_status(
+        active_mode="realtime",
+        config_mode="cascaded",
+        realtime_provider="gpt-realtime-2",
+        stt_provider="moonshine",
+        tts_provider="kokoro",
+        guild_id=123,
+        channel_id=456,
+        per_channel_record={"mode": "realtime", "realtime_provider": "gpt-realtime-2"},
+    )
+    assert "realtime" in out and "gpt-realtime-2" in out
+    assert "this channel overrides" in out.lower() or "override" in out.lower()
+
+
+def test_status_formatter_no_override_label() -> None:
+    from hermes_s2s.voice.slash_format import format_status
+
+    out = format_status(
+        active_mode="cascaded",
+        config_mode="cascaded",
+        realtime_provider="gemini-live",
+        stt_provider="moonshine",
+        tts_provider="kokoro",
+        guild_id=123,
+        channel_id=456,
+        per_channel_record={},
+    )
+    assert "global default" in out.lower() or "no channel override" in out.lower()
+
+
+def test_help_formatter_lists_all_subcommands() -> None:
+    from hermes_s2s.voice.slash_format import format_help
+
+    out = format_help()
+    for sub in ("configure", "status", "mode", "provider", "test", "doctor", "reset"):
+        assert f"/s2s {sub}" in out, f"missing /s2s {sub} in help text"
+
+
+def test_doctor_summary_shows_counts_and_top_failures() -> None:
+    from hermes_s2s.voice.slash_format import format_doctor_summary
+
+    report = {
+        "overall_status": "fail",
+        "checks": [
+            {"category": "configuration", "name": "mode", "status": "pass",
+             "message": "mode=cascaded", "remediation": None},
+            {"category": "python_deps", "name": "moonshine_onnx", "status": "pass",
+             "message": "ok", "remediation": None},
+            {"category": "api_keys", "name": "OPENAI_API_KEY", "status": "fail",
+             "message": "env var not set",
+             "remediation": "export OPENAI_API_KEY=sk-…"},
+            {"category": "system_deps", "name": "ffmpeg", "status": "warn",
+             "message": "old version",
+             "remediation": "apt install ffmpeg"},
+            {"category": "backend_connectivity", "name": "realtime_probe",
+             "status": "fail",
+             "message": "timed out",
+             "remediation": "check network"},
+            {"category": "api_keys", "name": "GEMINI_API_KEY", "status": "fail",
+             "message": "env var not set",
+             "remediation": "export GEMINI_API_KEY=..."},
+        ],
+    }
+    summary = format_doctor_summary(report)
+    # pass/warn/fail counts surfaced
+    assert "2" in summary  # 2 pass
+    assert "1" in summary  # 1 warn
+    assert "3" in summary  # 3 fail
+    # Overall status surfaced
+    assert "fail" in summary.lower()
+    # Top failures surfaced (first 3)
+    assert "OPENAI_API_KEY" in summary
+    assert "realtime_probe" in summary
+    assert "GEMINI_API_KEY" in summary
+    # Remediation text included for at least one failure
+    assert "export" in summary.lower() or "check network" in summary.lower()
+
+
+def test_doctor_summary_all_pass() -> None:
+    from hermes_s2s.voice.slash_format import format_doctor_summary
+
+    report = {
+        "overall_status": "pass",
+        "checks": [
+            {"category": "configuration", "name": "mode", "status": "pass",
+             "message": "ok", "remediation": None},
+            {"category": "python_deps", "name": "websockets", "status": "pass",
+             "message": "ok", "remediation": None},
+        ],
+    }
+    summary = format_doctor_summary(report)
+    assert "pass" in summary.lower()
+    # No failure block when nothing failed
+    assert "no failures" in summary.lower() or "all checks passed" in summary.lower()
