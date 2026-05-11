@@ -2,6 +2,33 @@
 
 > A standalone Hermes plugin that gives Discord, Telegram, and CLI voice mode the **full S2S backend matrix**: native realtime models (Gemini Live, GPT-4o Realtime), cloud cascaded pipelines, hybrid local+cloud, and fully-local pipelines (your own Moonshine+vLLM+Kokoro server). Mix and match per-stage. Configurable per-call.
 
+## What's new in 0.5.0
+
+**`/s2s` rich configuration UI** (see ADR-0015,
+`docs/plans/wave-0.5.0-s2s-configure.md`, and
+[`docs/HOWTO-S2S-CONFIGURE.md`](docs/HOWTO-S2S-CONFIGURE.md)):
+
+- **`/s2s configure` Discord rich panel** — ephemeral message with
+  select menus (mode + realtime / STT / TTS providers) and Test /
+  Reset / Refresh buttons. Selections persist immediately to
+  `~/.hermes/.s2s_mode_overrides.json`.
+- **Discord subcommand surface** — `/s2s mode | status | provider |
+  test | doctor | reset | configure` as proper Discord slash
+  subcommands.
+- **Telegram `/s2s`** — inline-keyboard configuration on Telegram with
+  the same mode + provider matrix.
+- **CLI `/s2s`** — full subcommand router with pretty-printed status
+  (no more raw JSON in your terminal).
+- **Per-channel provider overrides** — `realtime_provider`,
+  `stt_provider`, `tts_provider` join `mode` in the override store.
+  Run `gpt-realtime-2` in one channel and `cascaded/moonshine+kokoro`
+  in another without restarting the bot.
+- **Backwards-compatible storage.** 0.4.x bare-string entries on disk
+  auto-lift to dict shape on first read; no migration tool needed.
+
+After upgrading: `hermes gateway restart` so Discord re-syncs the new
+command Group, then `/s2s configure` in any channel to verify.
+
 ## What's new in 0.4.0
 
 **Voice-mode rearchitecture** (see `docs/plans/wave-0.4.0-rearchitecture.md`,

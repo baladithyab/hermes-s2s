@@ -101,6 +101,50 @@ class S2SConfig:
         provider_block = cfg.options.get(cfg.provider, {})
         return provider_block if isinstance(provider_block, dict) else {}
 
+    # ------------------------------------------------------------------
+    # v0.5.0 (Wave 1) — per-channel override builders
+    # ------------------------------------------------------------------
+    #
+    # These ``with_*`` helpers return a shallow copy of the config with
+    # one field swapped out. ``resolve_s2s_config_for_channel`` in
+    # ``voice/factory.py`` chains them when applying the per-channel
+    # record from ``S2SModeOverrideStore`` so the cached singleton from
+    # ``load_config()`` is never mutated.
+    #
+    # ``S2SConfig`` is NOT a frozen dataclass (it carries a ``raw`` dict
+    # users sometimes mutate post-load), so ``dataclasses.replace`` is
+    # the safe shallow-copy primitive here.
+
+    def with_mode(self, mode: str) -> "S2SConfig":
+        """Return a copy with ``mode`` swapped."""
+        import dataclasses as _dc
+
+        return _dc.replace(self, mode=str(mode))
+
+    def with_realtime_provider(self, provider: str) -> "S2SConfig":
+        """Return a copy with ``realtime_provider`` swapped."""
+        import dataclasses as _dc
+
+        return _dc.replace(self, realtime_provider=str(provider))
+
+    def with_stt_provider(self, provider: str) -> "S2SConfig":
+        """Return a copy with the cascaded STT provider swapped.
+
+        The nested :class:`StageConfig` is also copied so the original
+        ``stt`` instance shared with the cached config is left intact.
+        """
+        import dataclasses as _dc
+
+        new_stt = _dc.replace(self.stt, provider=str(provider))
+        return _dc.replace(self, stt=new_stt)
+
+    def with_tts_provider(self, provider: str) -> "S2SConfig":
+        """Return a copy with the cascaded TTS provider swapped."""
+        import dataclasses as _dc
+
+        new_tts = _dc.replace(self.tts, provider=str(provider))
+        return _dc.replace(self, tts=new_tts)
+
 
 # ---------------------------------------------------------------------------
 # Auto-translate fallback (M5.1 part 2)

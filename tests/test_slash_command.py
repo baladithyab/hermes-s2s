@@ -43,9 +43,10 @@ def test_store_get_set(tmp_path: Path) -> None:
     assert store.get(111, 222) == "realtime"
 
     # The file must exist on disk with the merged payload.
+    # v0.5.0 (Wave 1): on-disk values are dict-shaped, not bare strings.
     assert store_path.exists()
     data = json.loads(store_path.read_text())
-    assert data["111:222"] == "realtime"
+    assert data["111:222"] == {"mode": "realtime"}
 
     # clear() removes the entry.
     store.clear(111, 222)
@@ -186,10 +187,13 @@ def test_concurrent_writes_dont_corrupt(tmp_path: Path) -> None:
     assert isinstance(data, dict)
 
     # All 10 writes present.
+    # v0.5.0 (Wave 1): each on-disk value is a dict, not a bare string.
     for cid, mode in writes:
         key = f"42:{cid}"
         assert key in data, f"missing {key} in {list(data)}"
-        assert data[key] == mode, f"expected {mode} at {key}, got {data[key]}"
+        assert data[key] == {"mode": mode}, (
+            f"expected {{'mode': {mode!r}}} at {key}, got {data[key]}"
+        )
 
     # Fresh store reads the same thing back.
     fresh = S2SModeOverrideStore(path=store_path)
@@ -328,10 +332,31 @@ def test_bridge_folds_store_into_router_channel_overrides(
     monkeypatch.setattr(slash_mod, "_store_singleton", seeded, raising=False)
 
     # Fake cfg object: mode defaults to cascaded.
+    # v0.5.0 Wave 1: ``_attach_realtime_to_voice_client`` now routes through
+    # ``resolve_s2s_config_for_channel`` which calls ``cfg.with_*`` helpers
+    # when the per-channel record has overrides. The fake must expose those
+    # so the bridge keeps progressing to the ModeRouter capture below.
     class FakeCfg:
         mode = "cascaded"
         voice = None
         realtime_provider = None
+
+        def with_mode(self, mode: str) -> "FakeCfg":  # noqa: D401
+            new = FakeCfg()
+            new.mode = mode
+            return new
+
+        def with_realtime_provider(self, p: str) -> "FakeCfg":
+            new = FakeCfg()
+            new.mode = self.mode
+            new.realtime_provider = p
+            return new
+
+        def with_stt_provider(self, p: str) -> "FakeCfg":  # pragma: no cover
+            return self
+
+        def with_tts_provider(self, p: str) -> "FakeCfg":  # pragma: no cover
+            return self
 
     monkeypatch.setattr(
         discord_bridge, "load_config", lambda: FakeCfg(), raising=False
@@ -384,3 +409,236 @@ def test_bridge_folds_store_into_router_channel_overrides(
     ) == "realtime", (
         f"expected channel_overrides[2002]='realtime', got {channel_overrides!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Wave 1 / 0.5.0 — dict-shaped record API                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_get_record_returns_dict_for_new_entries(tmp_path: Path) -> None:
+    """0.5.0: set_record / get_record round-trip a dict-shaped record."""
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    store.set_record(123, 456, {"mode": "realtime", "realtime_provider": "gpt-realtime-2"})
+    rec = store.get_record(123, 456)
+    assert rec == {"mode": "realtime", "realtime_provider": "gpt-realtime-2"}
+
+
+def test_get_record_lifts_legacy_string(tmp_path: Path) -> None:
+    """Pre-0.5.0 entries on disk are bare strings; new readers must lift them
+    losslessly into ``{"mode": <str>}``.
+    """
+    p = tmp_path / "ovr.json"
+    p.write_text(json.dumps({"123:456": "cascaded"}), encoding="utf-8")
+    store = S2SModeOverrideStore(path=p)
+    rec = store.get_record(123, 456)
+    assert rec == {"mode": "cascaded"}
+
+
+def test_legacy_get_method_still_works_after_dict_upgrade(tmp_path: Path) -> None:
+    """Existing factory.py call sites using ``.get()`` must continue to return
+    the mode string unchanged after the schema migration.
+    """
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    store.set_record(123, 456, {"mode": "s2s-server", "stt_provider": "groq"})
+    assert store.get(123, 456) == "s2s-server"
+
+
+# --------------------------------------------------------------------------- #
+# Wave 2 / Task 2.1 — pure-text formatters (slash_format)                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_status_formatter_renders_active_mode_and_providers() -> None:
+    from hermes_s2s.voice.slash_format import format_status
+
+    out = format_status(
+        active_mode="realtime",
+        config_mode="cascaded",
+        realtime_provider="gpt-realtime-2",
+        stt_provider="moonshine",
+        tts_provider="kokoro",
+        guild_id=123,
+        channel_id=456,
+        per_channel_record={"mode": "realtime", "realtime_provider": "gpt-realtime-2"},
+    )
+    assert "realtime" in out and "gpt-realtime-2" in out
+    assert "this channel overrides" in out.lower() or "override" in out.lower()
+
+
+def test_status_formatter_no_override_label() -> None:
+    from hermes_s2s.voice.slash_format import format_status
+
+    out = format_status(
+        active_mode="cascaded",
+        config_mode="cascaded",
+        realtime_provider="gemini-live",
+        stt_provider="moonshine",
+        tts_provider="kokoro",
+        guild_id=123,
+        channel_id=456,
+        per_channel_record={},
+    )
+    assert "global default" in out.lower() or "no channel override" in out.lower()
+
+
+def test_help_formatter_lists_all_subcommands() -> None:
+    from hermes_s2s.voice.slash_format import format_help
+
+    out = format_help()
+    for sub in ("configure", "status", "mode", "provider", "test", "doctor", "reset"):
+        assert f"/s2s {sub}" in out, f"missing /s2s {sub} in help text"
+
+
+def test_doctor_summary_shows_counts_and_top_failures() -> None:
+    from hermes_s2s.voice.slash_format import format_doctor_summary
+
+    report = {
+        "overall_status": "fail",
+        "checks": [
+            {"category": "configuration", "name": "mode", "status": "pass",
+             "message": "mode=cascaded", "remediation": None},
+            {"category": "python_deps", "name": "moonshine_onnx", "status": "pass",
+             "message": "ok", "remediation": None},
+            {"category": "api_keys", "name": "OPENAI_API_KEY", "status": "fail",
+             "message": "env var not set",
+             "remediation": "export OPENAI_API_KEY=sk-…"},
+            {"category": "system_deps", "name": "ffmpeg", "status": "warn",
+             "message": "old version",
+             "remediation": "apt install ffmpeg"},
+            {"category": "backend_connectivity", "name": "realtime_probe",
+             "status": "fail",
+             "message": "timed out",
+             "remediation": "check network"},
+            {"category": "api_keys", "name": "GEMINI_API_KEY", "status": "fail",
+             "message": "env var not set",
+             "remediation": "export GEMINI_API_KEY=..."},
+        ],
+    }
+    summary = format_doctor_summary(report)
+    # pass/warn/fail counts surfaced
+    assert "2" in summary  # 2 pass
+    assert "1" in summary  # 1 warn
+    assert "3" in summary  # 3 fail
+    # Overall status surfaced
+    assert "fail" in summary.lower()
+    # Top failures surfaced (first 3)
+    assert "OPENAI_API_KEY" in summary
+    assert "realtime_probe" in summary
+    assert "GEMINI_API_KEY" in summary
+    # Remediation text included for at least one failure
+    assert "export" in summary.lower() or "check network" in summary.lower()
+
+
+def test_doctor_summary_all_pass() -> None:
+    from hermes_s2s.voice.slash_format import format_doctor_summary
+
+    report = {
+        "overall_status": "pass",
+        "checks": [
+            {"category": "configuration", "name": "mode", "status": "pass",
+             "message": "ok", "remediation": None},
+            {"category": "python_deps", "name": "websockets", "status": "pass",
+             "message": "ok", "remediation": None},
+        ],
+    }
+    summary = format_doctor_summary(report)
+    assert "pass" in summary.lower()
+    # No failure block when nothing failed
+    assert "no failures" in summary.lower() or "all checks passed" in summary.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Wave 2 / Task 2.2 — /s2s is now an app_commands.Group with subcommands      #
+# --------------------------------------------------------------------------- #
+
+
+def test_install_creates_group_with_subcommands() -> None:
+    """The Discord tree should receive a Group named 's2s' with the expected
+    leaf subcommands: mode, status, provider, test, doctor, reset.
+
+    Uses a real ``discord.Client`` + ``app_commands.CommandTree`` so we
+    verify against the real ``tree.get_command`` / ``Group.commands``
+    public API, not a bespoke mock.
+    """
+    pytest.importorskip("discord")
+    import discord
+    from discord import app_commands
+
+    intents = discord.Intents.none()
+    client = discord.Client(intents=intents)
+    tree = app_commands.CommandTree(client)
+
+    ctx = MagicMock(spec=[])
+    ctx.tree = tree
+
+    installed = install_s2s_command(ctx)
+    assert installed is True
+
+    cmd = tree.get_command("s2s")
+    assert cmd is not None, "tree has no top-level 's2s' command after install"
+    # It must be a Group, not a leaf Command — duck-type via ``.commands``.
+    assert hasattr(cmd, "commands"), (
+        "top-level 's2s' is not a Group; expected app_commands.Group with subcommands"
+    )
+    sub_names = {c.name for c in cmd.commands}
+    assert {"mode", "status", "provider", "test", "doctor", "reset"} <= sub_names, (
+        f"missing subcommands; got {sub_names}"
+    )
+
+
+def test_install_creates_group_is_idempotent() -> None:
+    """Repeated install on the same tree still no-ops after the refactor."""
+    pytest.importorskip("discord")
+    import discord
+    from discord import app_commands
+
+    client = discord.Client(intents=discord.Intents.none())
+    tree = app_commands.CommandTree(client)
+    ctx = MagicMock(spec=[])
+    ctx.tree = tree
+
+    first = install_s2s_command(ctx)
+    second = install_s2s_command(ctx)
+    assert first is True
+    assert second is False
+    assert tree.get_command("s2s") is not None
+
+
+# --------------------------------------------------------------------------- #
+# Wave 4 / Task 4.1 — CLI /s2s subcommand router                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_s2s_command_routes_subcommands(tmp_path, monkeypatch):
+    from hermes_s2s.tools import handle_s2s_command
+
+    # No-arg → status
+    out = handle_s2s_command("")
+    assert "active_mode" in out or "Active mode" in out  # JSON or formatted
+
+    # mode set
+    out = handle_s2s_command("mode realtime")
+    assert "realtime" in out
+
+    # provider set (in CLI we don't have guild_id/channel_id — should still work
+    # via a session-scoped path or a clear guidance message)
+    out = handle_s2s_command("provider realtime gpt-realtime-2")
+    # Not great UX without channel ctx; should accept and warn
+    assert (
+        "gpt-realtime-2" in out
+        or "warn" in out.lower()
+        or "global" in out.lower()
+        or "config.yaml" in out.lower()
+    )
+
+    # help
+    out = handle_s2s_command("help")
+    assert "configure" in out and "mode" in out and "provider" in out
+
+
+def test_handle_s2s_command_unknown_subcommand_shows_help():
+    from hermes_s2s.tools import handle_s2s_command
+
+    out = handle_s2s_command("frobnicate")
+    assert "Usage" in out or "configure" in out

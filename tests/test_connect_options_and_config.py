@@ -186,5 +186,53 @@ def test_existing_positional_connect_signature_still_supported() -> None:
     assert opts.history is None
 
 
+# ---------- Wave 1 / 0.5.0 — factory consumes provider overrides ------ #
+
+
+def test_factory_uses_per_channel_realtime_provider_override(
+    tmp_path, monkeypatch
+):
+    """Per-channel realtime_provider override must flow into the resolved
+    S2SConfig. Wave 1 Task 1.3 acceptance.
+    """
+    from hermes_s2s.voice.slash import S2SModeOverrideStore
+    from hermes_s2s.voice import factory as fac
+
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    store.set_record(
+        123, 456, {"mode": "realtime", "realtime_provider": "gpt-realtime-mini"}
+    )
+    monkeypatch.setattr(fac, "get_default_store", lambda: store)
+    cfg = fac.resolve_s2s_config_for_channel(guild_id=123, channel_id=456)
+    assert cfg.mode == "realtime"
+    assert cfg.realtime_provider == "gpt-realtime-mini"
+
+
+def test_factory_falls_back_to_global_when_no_override(tmp_path, monkeypatch):
+    """No per-channel record → global config wins; no crash."""
+    from hermes_s2s.voice.slash import S2SModeOverrideStore
+    from hermes_s2s.voice import factory as fac
+
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    monkeypatch.setattr(fac, "get_default_store", lambda: store)
+    cfg = fac.resolve_s2s_config_for_channel(guild_id=999, channel_id=888)
+    # No override → global config wins; just assert no crash + valid mode
+    assert cfg.mode in {"cascaded", "realtime", "s2s-server", "pipeline"}
+
+
+def test_factory_partial_override_keeps_other_keys_global(
+    tmp_path, monkeypatch
+):
+    """Only TTS overridden; mode + STT come from global config."""
+    from hermes_s2s.voice.slash import S2SModeOverrideStore
+    from hermes_s2s.voice import factory as fac
+
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    store.set_record(123, 456, {"tts_provider": "elevenlabs"})
+    monkeypatch.setattr(fac, "get_default_store", lambda: store)
+    cfg = fac.resolve_s2s_config_for_channel(guild_id=123, channel_id=456)
+    assert cfg.tts.provider == "elevenlabs"
+
+
 # Need to import dataclasses at module-level for the FrozenInstanceError test
 import dataclasses  # noqa: E402

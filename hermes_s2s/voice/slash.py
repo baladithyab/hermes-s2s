@@ -1,4 +1,4 @@
-"""Plugin-owned Discord ``/s2s`` slash command + per-channel mode override store.
+"""Plugin-owned Discord ``/s2s`` slash command + per-channel override store.
 
 Implements WAVE 2a / M2.1 of the 0.4.0 re-architecture (Discord-only; Telegram
 and CLI scopes deferred to 0.4.1). See:
@@ -7,12 +7,20 @@ and CLI scopes deferred to 0.4.1). See:
 - docs/research/13-mode-ux-deep-dive.md §4 (the exact command pattern)
 - docs/plans/wave-0.4.0-rearchitecture.md WAVE 2a (A3 cross-process + A4 flock
   acceptance criteria)
+- docs/adrs/0015-s2s-configure-rich-ui.md + docs/plans/wave-0.5.0-s2s-configure.md
+  (Wave 1 — schema migration from bare-string mode to dict-shaped record).
 
-The store persists to ``<HERMES_HOME>/.s2s_mode_overrides.json`` as a flat
-``{"guild_id:channel_id": mode_value}`` map. Writes go through a
-temp-file+atomic-rename path with an ``fcntl.flock(LOCK_EX)`` wrapper so
-concurrent writes from multiple processes (or many threads in one process)
-can't corrupt the file — Phase-8 security P1-F8.
+The store persists to ``<HERMES_HOME>/.s2s_mode_overrides.json``. As of v0.5.0
+(Wave 1) each entry is a JSON object — ``{"mode": "...", "realtime_provider":
+"...", "stt_provider": "...", "tts_provider": "..."}`` — so per-channel overrides
+can carry provider keys alongside the mode. Pre-0.5.0 bare-string values are
+lifted on read into ``{"mode": <str>}`` losslessly; the legacy ``set``/``get``
+methods are kept as thin shims so existing factory call sites keep working.
+
+Writes go through a temp-file+atomic-rename path with an
+``fcntl.flock(LOCK_EX)`` wrapper so concurrent writes from multiple processes
+(or many threads in one process) can't corrupt the file — Phase-8 security
+P1-F8.
 """
 
 from __future__ import annotations
@@ -24,9 +32,10 @@ import os
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from .modes import VoiceMode
+from .slash_format import format_doctor_summary, format_status
 
 
 logger = logging.getLogger(__name__)
@@ -63,16 +72,38 @@ def _default_store_path() -> Path:
         return Path(home) / _OVERRIDES_FILENAME
 
 
+def _coerce_value(v: Any) -> Dict[str, str]:
+    """Lift any on-disk entry into the canonical dict-shape.
+
+    - Pre-0.5.0 entries on disk are bare strings — lift to ``{"mode": <str>}``.
+    - 0.5.0+ entries are dicts — coerce keys/values to strings, drop empties.
+    - Anything else (None, lists, numbers) collapses to the empty dict so a
+      corrupted file doesn't crash the loader.
+    """
+    if isinstance(v, str):
+        return {"mode": v}
+    if isinstance(v, dict):
+        return {str(k): str(val) for k, val in v.items() if val is not None and str(val) != ""}
+    return {}
+
+
 class S2SModeOverrideStore:
-    """Persistent per-(guild_id, channel_id) voice-mode override store.
+    """Persistent per-(guild_id, channel_id) S2S override store.
 
     The store is deliberately simple: a JSON file on disk, lazy-loaded on
-    first access, flushed atomically after every ``set``/``clear`` with
-    an OS-level exclusive file lock. The in-memory cache is refreshed
-    on demand via :meth:`reload` — callers that need cross-process
-    consistency should call :meth:`reload` before :meth:`get` in hot
-    paths (the voice-join flow does this once per join — cost is
-    negligible).
+    first access, flushed atomically after every ``set``/``set_record``/
+    ``patch_record``/``clear`` with an OS-level exclusive file lock. The
+    in-memory cache is refreshed on demand via :meth:`reload` — callers
+    that need cross-process consistency should call :meth:`reload` before
+    :meth:`get` in hot paths (the voice-join flow does this once per join
+    — cost is negligible).
+
+    Schema (v0.5.0+)
+    ----------------
+    Each entry is a dict ``{"mode": "...", "realtime_provider": "...",
+    "stt_provider": "...", "tts_provider": "..."}``. All keys are optional;
+    missing keys mean "fall through to the global config". Pre-0.5.0
+    bare-string entries are lifted on read into ``{"mode": <str>}``.
     """
 
     def __init__(self, path: Optional[Path] = None) -> None:
@@ -80,7 +111,8 @@ class S2SModeOverrideStore:
         # In-process lock guards the cache dict + the file-writing section.
         # File-level locking (flock) is additive, for cross-process safety.
         self._lock = threading.Lock()
-        self._cache: dict[str, str] = {}
+        # v0.5.0: cache value is now a dict-shaped record, not a bare string.
+        self._cache: Dict[str, Dict[str, str]] = {}
         self._loaded = False
 
     # --- helpers --------------------------------------------------------
@@ -95,15 +127,21 @@ class S2SModeOverrideStore:
         self._load_locked()
 
     def _load_locked(self) -> None:
-        """Populate ``self._cache`` from disk; tolerate missing/corrupt file."""
+        """Populate ``self._cache`` from disk; tolerate missing/corrupt file.
+
+        Each value is fed through :func:`_coerce_value` so legacy bare-string
+        entries are lifted into the dict-shape on read.
+        """
         try:
             with self._path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if isinstance(data, dict):
-                # Coerce all values to strings; drop any non-dict entries.
-                self._cache = {
-                    str(k): str(v) for k, v in data.items() if v is not None
-                }
+                cache: Dict[str, Dict[str, str]] = {}
+                for k, v in data.items():
+                    rec = _coerce_value(v)
+                    if rec:
+                        cache[str(k)] = rec
+                self._cache = cache
             else:
                 logger.warning(
                     "hermes-s2s: override store at %s is not a dict; ignoring",
@@ -128,30 +166,82 @@ class S2SModeOverrideStore:
             self._loaded = False
             self._load_locked()
 
-    # --- public API -----------------------------------------------------
+    # --- public API: rich (v0.5.0+) ------------------------------------
 
-    def get(self, guild_id: int, channel_id: int) -> str | None:
+    def get_record(self, guild_id: int, channel_id: int) -> Dict[str, str]:
+        """Return the full per-channel record (or an empty dict if absent)."""
         with self._lock:
             self._ensure_loaded()
-            return self._cache.get(self._key(guild_id, channel_id))
+            return dict(self._cache.get(self._key(guild_id, channel_id), {}))
+
+    def set_record(
+        self, guild_id: int, channel_id: int, record: Dict[str, str]
+    ) -> None:
+        """Replace the entire record for ``(guild_id, channel_id)``.
+
+        Empty/None record clears the entry. The ``mode`` key, if present,
+        is normalized via :meth:`VoiceMode.normalize` so aliases land on
+        disk as canonical values; an unparseable mode is dropped (other
+        keys preserved) rather than failing the write.
+        """
+        cleaned = {
+            str(k): str(v) for k, v in (record or {}).items() if v not in (None, "")
+        }
+        if "mode" in cleaned:
+            try:
+                cleaned["mode"] = VoiceMode.normalize(cleaned["mode"]).value
+            except ValueError:
+                cleaned.pop("mode", None)
+        with self._lock:
+            self._ensure_loaded()
+            merged = dict(self._cache)
+            if cleaned:
+                merged[self._key(guild_id, channel_id)] = cleaned
+            else:
+                merged.pop(self._key(guild_id, channel_id), None)
+            self._write_atomic(merged)
+            self._cache = merged
+
+    def patch_record(
+        self, guild_id: int, channel_id: int, **fields: str
+    ) -> Dict[str, str]:
+        """Merge ``fields`` into the existing record; return the new record."""
+        with self._lock:
+            self._ensure_loaded()
+            existing = dict(self._cache.get(self._key(guild_id, channel_id), {}))
+        cleaned = {k: v for k, v in fields.items() if v not in (None, "")}
+        if "mode" in cleaned:
+            try:
+                cleaned["mode"] = VoiceMode.normalize(cleaned["mode"]).value
+            except ValueError:
+                cleaned.pop("mode", None)
+        existing.update({str(k): str(v) for k, v in cleaned.items()})
+        self.set_record(guild_id, channel_id, existing)
+        return existing
+
+    # --- public API: back-compat shims (legacy mode-only callers) ------
+
+    def get(self, guild_id: int, channel_id: int) -> str | None:
+        """Return the stored mode string, or ``None`` if no override.
+
+        Back-compat shim around :meth:`get_record` for pre-0.5.0 callers
+        that only care about the mode field.
+        """
+        rec = self.get_record(guild_id, channel_id)
+        return rec.get("mode") if rec else None
 
     def set(self, guild_id: int, channel_id: int, mode: str) -> None:
         """Persist ``mode`` for ``(guild_id, channel_id)``.
 
-        ``mode`` is normalized via :meth:`VoiceMode.normalize` so aliases
-        like ``"s2s_server"`` land on disk as canonical ``"s2s-server"``.
+        Back-compat shim that patches only the ``mode`` field, preserving
+        any provider keys an existing record may have. ``mode`` is
+        normalized via :meth:`VoiceMode.normalize` so aliases like
+        ``"s2s_server"`` land on disk as canonical ``"s2s-server"``.
         """
-        canonical = VoiceMode.normalize(mode).value
-        with self._lock:
-            self._ensure_loaded()
-            # Re-read from disk under flock so we don't clobber a write
-            # from a concurrent process between our load and our write.
-            merged = dict(self._cache)
-            merged[self._key(guild_id, channel_id)] = canonical
-            self._write_atomic(merged)
-            self._cache = merged
+        self.patch_record(guild_id, channel_id, mode=mode)
 
     def clear(self, guild_id: int, channel_id: int) -> None:
+        """Remove the entire per-channel record."""
         with self._lock:
             self._ensure_loaded()
             merged = dict(self._cache)
@@ -161,7 +251,7 @@ class S2SModeOverrideStore:
 
     # --- atomic, flock-protected write ---------------------------------
 
-    def _write_atomic(self, payload: dict[str, str]) -> None:
+    def _write_atomic(self, payload: Dict[str, Dict[str, str]]) -> None:
         """Serialize ``payload`` → temp → fsync → os.replace, under flock.
 
         Strategy:
@@ -176,6 +266,12 @@ class S2SModeOverrideStore:
            directory, ``flush()`` + ``fsync()``, then ``os.replace``
            over the real path (atomic on POSIX + modern NTFS).
         5. Release the flock.
+
+        v0.5.0: payload values are dict-shaped. Legacy bare-string entries
+        encountered on disk during the merge are lifted via
+        :func:`_coerce_value` so a parallel writer running an older
+        version doesn't get its data dropped — though once we write back,
+        the file is in the new shape.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -189,14 +285,15 @@ class S2SModeOverrideStore:
                 # Merge with whatever is on disk right now (another process
                 # may have written between our last cache load and this
                 # write). We still keep our just-set entries on top.
-                disk: dict[str, str] = {}
+                disk: Dict[str, Dict[str, str]] = {}
                 try:
                     with self._path.open("r", encoding="utf-8") as fh:
                         loaded = json.load(fh)
                     if isinstance(loaded, dict):
-                        disk = {
-                            str(k): str(v) for k, v in loaded.items() if v is not None
-                        }
+                        for k, v in loaded.items():
+                            rec = _coerce_value(v)
+                            if rec:
+                                disk[str(k)] = rec
                 except (FileNotFoundError, OSError, json.JSONDecodeError):
                     disk = {}
                 # Our in-memory payload wins per key (we want set/clear
@@ -267,6 +364,229 @@ def get_default_store() -> S2SModeOverrideStore:
         if _store_singleton is None:
             _store_singleton = S2SModeOverrideStore()
         return _store_singleton
+
+
+# ---------------------------------------------------------------------------
+# S2SConfigureView — rich /s2s configure panel (Wave 2 / Task 2.3)
+# ---------------------------------------------------------------------------
+#
+# The View subclasses ``discord.ui.View`` so discord.py MUST be importable
+# at class-definition time. We do a top-level try-import and let
+# ``S2SConfigureView`` remain undefined when discord.py is absent — tests
+# ``pytest.importorskip("discord")`` before importing the symbol.
+try:  # pragma: no cover - import-time guard
+    import discord as _discord_mod  # type: ignore
+    from discord import ui as _ui  # type: ignore
+except ImportError:  # pragma: no cover - environment-dependent
+    _discord_mod = None  # type: ignore[assignment]
+    _ui = None  # type: ignore[assignment]
+
+
+if _ui is not None:
+
+    class S2SConfigureView(_ui.View):  # type: ignore[misc, valid-type]
+        """Rich configuration panel for ``/s2s configure``.
+
+        Lifetime: 5 minutes (default View timeout); on timeout the
+        controls disable themselves but the message stays as a summary.
+
+        Components
+        ----------
+        - Mode select (4 canonical modes).
+        - Per-kind provider select for every kind with at least one
+          registered provider. Options are ``[:25]`` sliced because
+          Discord caps a Select at 25 options.
+        - Three buttons: Test pipeline / Reset overrides / Refresh status.
+
+        Every select and button patches the override store via the same
+        ``S2SModeOverrideStore`` used by the direct ``/s2s mode`` and
+        ``/s2s provider`` subcommands so the two surfaces can't drift.
+        """
+
+        def __init__(
+            self,
+            *,
+            guild_id: int,
+            channel_id: int,
+            store: "S2SModeOverrideStore",
+        ) -> None:
+            super().__init__(timeout=300.0)
+            self._g = int(guild_id)
+            self._c = int(channel_id)
+            self._store = store
+            # Build options dynamically from the live registry so e.g. a
+            # plugin-registered TTS provider shows up in the picker on
+            # next /s2s configure.
+            from ..registry import list_registered
+
+            reg = list_registered()
+            self._add_mode_select()
+            self._add_provider_select("realtime", list(reg.get("realtime", [])))
+            self._add_provider_select("stt", list(reg.get("stt", [])))
+            self._add_provider_select("tts", list(reg.get("tts", [])))
+
+        # ----- select builders -----------------------------------------
+
+        def _add_mode_select(self) -> None:
+            opts = [
+                _discord_mod.SelectOption(label="Cascaded (default)", value="cascaded"),
+                _discord_mod.SelectOption(label="Pipeline (custom)", value="pipeline"),
+                _discord_mod.SelectOption(label="Realtime", value="realtime"),
+                _discord_mod.SelectOption(label="External server", value="s2s-server"),
+            ]
+            sel = _ui.Select(
+                placeholder="Pick a mode…",
+                options=opts,
+                min_values=1,
+                max_values=1,
+                custom_id="s2s_mode",
+            )
+
+            async def _cb(interaction: Any) -> None:
+                values = getattr(sel, "values", None) or []
+                if not values:
+                    data = getattr(interaction, "data", {}) or {}
+                    values = data.get("values") or []
+                if not values:
+                    return
+                v = values[0]
+                self._store.patch_record(self._g, self._c, mode=v)
+                await interaction.response.send_message(
+                    f"Mode → `{v}`", ephemeral=True
+                )
+
+            sel.callback = _cb  # type: ignore[assignment]
+            self.add_item(sel)
+
+        def _add_provider_select(self, kind: str, names: list[str]) -> None:
+            if not names:
+                return  # No registered providers of this kind — skip the row
+            # Discord caps a Select at 25 options — respect it.
+            opts = [
+                _discord_mod.SelectOption(label=n, value=n) for n in names[:25]
+            ]
+            placeholder = {
+                "realtime": "Pick realtime backend…",
+                "stt": "Pick STT provider…",
+                "tts": "Pick TTS provider…",
+            }.get(kind, f"Pick {kind}…")
+            field = f"{kind}_provider"
+            sel = _ui.Select(
+                placeholder=placeholder,
+                options=opts,
+                min_values=1,
+                max_values=1,
+                custom_id=f"s2s_{kind}",
+            )
+
+            async def _cb(interaction: Any) -> None:
+                values = getattr(sel, "values", None) or []
+                if not values:
+                    data = getattr(interaction, "data", {}) or {}
+                    values = data.get("values") or []
+                if not values:
+                    return
+                v = values[0]
+                self._store.patch_record(self._g, self._c, **{field: v})
+                await interaction.response.send_message(
+                    f"{kind.upper()} provider → `{v}`", ephemeral=True
+                )
+
+            sel.callback = _cb  # type: ignore[assignment]
+            self.add_item(sel)
+
+        # ----- buttons -------------------------------------------------
+
+        @_ui.button(  # type: ignore[misc]
+            label="Test pipeline",
+            style=_discord_mod.ButtonStyle.primary,
+            custom_id="s2s_test",
+        )
+        async def _test_btn(self, interaction: Any, _button: Any) -> None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            from ..tools import s2s_test_pipeline
+
+            r = json.loads(s2s_test_pipeline({}))
+            if r.get("ok"):
+                await interaction.followup.send(
+                    f"✅ TTS OK — wrote {r.get('bytes')} bytes via "
+                    f"`{r.get('tts_provider')}`",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ Test failed at `{r.get('stage')}`: {r.get('error')}",
+                    ephemeral=True,
+                )
+
+        @_ui.button(  # type: ignore[misc]
+            label="Reset overrides",
+            style=_discord_mod.ButtonStyle.danger,
+            custom_id="s2s_reset",
+        )
+        async def _reset_btn(self, interaction: Any, _button: Any) -> None:
+            self._store.set_record(self._g, self._c, {})
+            await interaction.response.send_message(
+                "✅ Cleared this channel's overrides.", ephemeral=True
+            )
+
+        @_ui.button(  # type: ignore[misc]
+            label="Refresh status",
+            style=_discord_mod.ButtonStyle.secondary,
+            custom_id="s2s_refresh",
+        )
+        async def _refresh_btn(self, interaction: Any, _button: Any) -> None:
+            from ..tools import s2s_status as _stat
+
+            payload = json.loads(_stat({}))
+            rec = self._store.get_record(self._g, self._c)
+            text = format_status(
+                active_mode=payload["active_mode"],
+                config_mode=payload["config_mode"],
+                realtime_provider=payload["realtime"]["provider"],
+                stt_provider=payload["cascaded"]["stt_provider"],
+                tts_provider=payload["cascaded"]["tts_provider"],
+                guild_id=self._g,
+                channel_id=self._c,
+                per_channel_record=rec,
+            )
+            await interaction.response.edit_message(content=text, view=self)
+
+        async def on_timeout(self) -> None:
+            """Disable every control once the view expires (5 min)."""
+            for child in self.children:
+                try:
+                    child.disabled = True  # type: ignore[attr-defined]
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+
+async def _require_guild_channel(interaction: Any) -> Optional[tuple[int, int]]:
+    """Return ``(guild_id, channel_id)`` or ``None`` after sending an error.
+
+    Subcommand callbacks use this to short-circuit cleanly when ``/s2s`` is
+    invoked from a DM or any non-guild-channel context. On failure it sends
+    an ephemeral error directly, so callers can just do::
+
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+    """
+    g = getattr(interaction, "guild", None)
+    c = getattr(interaction, "channel", None)
+    g_id = getattr(g, "id", None)
+    c_id = getattr(c, "id", None)
+    if g_id is None or c_id is None:
+        try:
+            await interaction.response.send_message(
+                "❌ `/s2s` must be used inside a guild text channel.",
+                ephemeral=True,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None
+    return int(g_id), int(c_id)
 
 
 def _find_discord_tree(ctx: Any) -> Any | None:
@@ -388,69 +708,220 @@ def install_s2s_command(ctx: Any) -> bool:
     _mod_globals.setdefault("Choice", Choice)
     _mod_globals.setdefault("Interaction", Interaction)
 
-    @app_commands.command(
+    # ------------------------------------------------------------------
+    # /s2s is a Group (Wave 2 / Task 2.2) with:
+    #   mode, status, provider, test, doctor, reset   ← this task
+    #   configure                                      ← Task 2.3
+    # ------------------------------------------------------------------
+    group = app_commands.Group(
         name="s2s",
-        description="Set the voice mode for the next /voice join",
+        description="Configure speech-to-speech voice",
     )
+
+    @group.command(name="mode", description="Set voice mode for this channel")
     @app_commands.choices(
         mode=[
-            app_commands.Choice(
-                name="Cascaded (default Hermes voice)", value="cascaded"
-            ),
-            app_commands.Choice(
-                name="Pipeline (custom STT+TTS)", value="pipeline"
-            ),
-            app_commands.Choice(
-                name="Realtime (Gemini Live / GPT-4o)", value="realtime"
-            ),
-            app_commands.Choice(
-                name="External S2S server", value="s2s-server"
-            ),
+            app_commands.Choice(name="Cascaded (default)", value="cascaded"),
+            app_commands.Choice(name="Pipeline (custom STT+TTS)", value="pipeline"),
+            app_commands.Choice(name="Realtime", value="realtime"),
+            app_commands.Choice(name="External S2S server", value="s2s-server"),
         ]
     )
-    async def s2s_command(  # type: ignore[no-untyped-def]
+    async def s2s_mode(  # type: ignore[no-untyped-def]
         interaction: Interaction,
         mode: Choice[str],
     ):
-        guild = getattr(interaction, "guild", None)
-        channel = getattr(interaction, "channel", None)
-        guild_id = getattr(guild, "id", None)
-        channel_id = getattr(channel, "id", None)
-        if guild_id is None or channel_id is None:
-            await interaction.response.send_message(
-                "❌ `/s2s` must be used inside a guild text channel.",
-                ephemeral=True,
-            )
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
             return
-
+        g, c = pair
         try:
             canonical = VoiceMode.normalize(mode.value)
         except ValueError as exc:
             await interaction.response.send_message(
-                f"❌ Unknown mode `{mode.value}`: {exc}",
-                ephemeral=True,
+                f"❌ Unknown mode `{mode.value}`: {exc}", ephemeral=True
             )
             return
-
         try:
-            store.set(int(guild_id), int(channel_id), canonical.value)
+            store.patch_record(g, c, mode=canonical.value)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("hermes-s2s: /s2s store.set failed: %s", exc)
+            logger.warning("hermes-s2s: /s2s mode patch_record failed: %s", exc)
             await interaction.response.send_message(
                 "❌ Couldn't save the override (see gateway logs).",
                 ephemeral=True,
             )
             return
-
         await interaction.response.send_message(
-            f"✅ Next /voice join in this channel will use **{mode.name}**.",
+            f"✅ This channel: mode → **{mode.name}**", ephemeral=True
+        )
+
+    @group.command(
+        name="status",
+        description="Show current S2S settings for this channel",
+    )
+    async def s2s_status_cmd(interaction: Interaction):  # type: ignore[no-untyped-def]
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        from ..tools import s2s_status as _status_tool
+        import json as _json
+
+        payload = _json.loads(_status_tool({}))
+        rec = store.get_record(g, c)
+        text = format_status(
+            active_mode=payload["active_mode"],
+            config_mode=payload["config_mode"],
+            realtime_provider=payload["realtime"]["provider"],
+            stt_provider=payload["cascaded"]["stt_provider"],
+            tts_provider=payload["cascaded"]["tts_provider"],
+            guild_id=g,
+            channel_id=c,
+            per_channel_record=rec,
+        )
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @group.command(
+        name="provider",
+        description="Override a single provider for this channel",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="Realtime backend", value="realtime"),
+            app_commands.Choice(name="STT (cascaded)", value="stt"),
+            app_commands.Choice(name="TTS (cascaded)", value="tts"),
+        ]
+    )
+    @app_commands.describe(
+        name="Provider name (see /s2s status for the available list)"
+    )
+    async def s2s_provider(  # type: ignore[no-untyped-def]
+        interaction: Interaction,
+        kind: Choice[str],
+        name: str,
+    ):
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        from ..registry import list_registered
+
+        field_map = {
+            "realtime": "realtime_provider",
+            "stt": "stt_provider",
+            "tts": "tts_provider",
+        }
+        field = field_map[kind.value]
+        available = list_registered().get(kind.value, [])
+        if name not in available:
+            listing = ", ".join(f"`{a}`" for a in available) or "_(none registered)_"
+            await interaction.response.send_message(
+                f"❌ Unknown {kind.value} provider `{name}`. Available: {listing}",
+                ephemeral=True,
+            )
+            return
+        try:
+            store.patch_record(g, c, **{field: name})
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "hermes-s2s: /s2s provider patch_record failed: %s", exc
+            )
+            await interaction.response.send_message(
+                "❌ Couldn't save the override (see gateway logs).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"✅ This channel: {kind.value} provider → **{name}**",
             ephemeral=True,
         )
 
+    @group.command(name="test", description="Run a TTS smoke test")
+    @app_commands.describe(text="Optional text to synthesise")
+    async def s2s_test(  # type: ignore[no-untyped-def]
+        interaction: Interaction,
+        text: str = "",
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from ..tools import s2s_test_pipeline
+        import json as _json
+
+        result = _json.loads(s2s_test_pipeline({"text": text or None}))
+        if result.get("ok"):
+            await interaction.followup.send(
+                f"✅ TTS OK — `{result.get('tts_provider')}` wrote "
+                f"{result.get('bytes')} bytes to `{result.get('wrote')}`",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ Smoke test failed at stage `{result.get('stage')}`: "
+                f"{result.get('error')}",
+                ephemeral=True,
+            )
+
+    @group.command(
+        name="doctor",
+        description="Run preflight checks (deps, keys, WS probe)",
+    )
+    async def s2s_doctor_cmd(interaction: Interaction):  # type: ignore[no-untyped-def]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from ..tools import s2s_doctor as _doctor
+        import json as _json
+
+        report_str = await _doctor({})
+        report = _json.loads(report_str)
+        summary = format_doctor_summary(report)
+        await interaction.followup.send(summary, ephemeral=True)
+
+    @group.command(
+        name="reset",
+        description="Clear all S2S overrides for this channel",
+    )
+    async def s2s_reset(interaction: Interaction):  # type: ignore[no-untyped-def]
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        store.set_record(g, c, {})
+        await interaction.response.send_message(
+            "✅ Cleared all S2S overrides for this channel — back to global config.",
+            ephemeral=True,
+        )
+
+    @group.command(
+        name="configure",
+        description="Open interactive S2S configuration panel",
+    )
+    async def s2s_configure(interaction: Interaction):  # type: ignore[no-untyped-def]
+        pair = await _require_guild_channel(interaction)
+        if pair is None:
+            return
+        g, c = pair
+        from ..tools import s2s_status as _stat
+        import json as _json
+
+        payload = _json.loads(_stat({}))
+        rec = store.get_record(g, c)
+        text = format_status(
+            active_mode=payload["active_mode"],
+            config_mode=payload["config_mode"],
+            realtime_provider=payload["realtime"]["provider"],
+            stt_provider=payload["cascaded"]["stt_provider"],
+            tts_provider=payload["cascaded"]["tts_provider"],
+            guild_id=g,
+            channel_id=c,
+            per_channel_record=rec,
+        )
+        view = S2SConfigureView(guild_id=g, channel_id=c, store=store)
+        await interaction.response.send_message(
+            text, view=view, ephemeral=True
+        )
+
     try:
-        tree.add_command(s2s_command)
+        tree.add_command(group)
     except Exception as exc:
-        logger.warning("hermes-s2s: tree.add_command(/s2s) failed: %s", exc)
+        logger.warning("hermes-s2s: tree.add_command(/s2s group) failed: %s", exc)
         return False
 
     setattr(tree, _S2S_COMMAND_INSTALLED, True)
@@ -463,7 +934,7 @@ def install_s2s_command(ctx: Any) -> bool:
         )
     else:
         logger.info(
-            "hermes-s2s: /s2s slash command registered on the Discord tree"
+            "hermes-s2s: /s2s slash command group registered on the Discord tree"
         )
     return True
 
@@ -473,3 +944,6 @@ __all__ = [
     "get_default_store",
     "install_s2s_command",
 ]
+
+if _ui is not None:
+    __all__.append("S2SConfigureView")

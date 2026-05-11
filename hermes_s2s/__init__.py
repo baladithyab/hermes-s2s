@@ -21,7 +21,7 @@ from .registry import (
     resolve_tts,
 )
 
-__version__ = "0.4.6"
+__version__ = "0.5.0"
 __all__ = [
     "S2SConfig",
     "load_config",
@@ -117,5 +117,37 @@ def register(ctx: Any) -> None:
     # ctx exposes a native voice-pipeline hook). See ADR-0006.
     from ._internal.discord_bridge import install_discord_voice_bridge
     install_discord_voice_bridge(ctx)
+
+    # Telegram /s2s inline-keyboard UI — mirror the Discord rich UI on any
+    # python-telegram-bot Application we can reach through ctx.runner.
+    # Failure is non-fatal: the plugin's tool handlers still work via the
+    # regular text /s2s command pipeline.
+    try:
+        from .voice.slash_telegram import install_s2s_telegram_handlers
+
+        runner = getattr(ctx, "runner", None)
+        adapters = getattr(runner, "adapters", {}) if runner is not None else {}
+        adapter_iter = adapters.values() if isinstance(adapters, dict) else []
+        for ad in adapter_iter:
+            # The live Hermes Telegram adapter stores its Application at
+            # ``self._app`` (see gateway/platforms/telegram.py). We check
+            # ``_application`` and ``application`` as defensive fallbacks
+            # in case a downstream fork renames the attribute.
+            app = (
+                getattr(ad, "_app", None)
+                or getattr(ad, "_application", None)
+                or getattr(ad, "application", None)
+            )
+            if app is None:
+                continue
+            # Duck-typing: a python-telegram-bot Application exposes
+            # add_handler + handlers.
+            if not callable(getattr(app, "add_handler", None)):
+                continue
+            if install_s2s_telegram_handlers(app):
+                logger.info("hermes-s2s: /s2s installed on Telegram")
+                break
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Telegram /s2s install skipped: %s", exc)
 
     logger.info("hermes-s2s plugin v%s registered", __version__)

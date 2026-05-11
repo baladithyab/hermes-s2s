@@ -161,25 +161,103 @@ async def s2s_doctor(args: dict, **kwargs: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def handle_s2s_command(raw_args: str) -> str:
-    """Implements the /s2s slash command.
+    """Implements the ``/s2s`` slash command for the CLI surface.
+
+    Mirrors the Discord ``app_commands.Group`` subcommands so muscle memory
+    carries across platforms. The CLI lacks a ``(guild_id, channel_id)``
+    context, so provider overrides print a guidance message rather than
+    writing to the per-channel override store — see Wave 4 / Task 4.1 in
+    ``docs/plans/wave-0.5.0-s2s-configure.md`` and ADR-0015.
 
     Examples:
         /s2s
         /s2s status
         /s2s mode realtime
-        /s2s mode cascaded
+        /s2s provider realtime gpt-realtime-2
+        /s2s test hello
+        /s2s doctor
+        /s2s reset
+        /s2s configure
+        /s2s help
     """
     parts = (raw_args or "").strip().split()
+
+    # ``status`` (and no-arg) — pretty-printed, not raw JSON.
     if not parts or parts[0] in {"status", "show", "info"}:
-        return s2s_status({})
+        from .voice.slash_format import format_status
+
+        payload = json.loads(s2s_status({}))
+        return format_status(
+            active_mode=payload["active_mode"],
+            config_mode=payload["config_mode"],
+            realtime_provider=payload["realtime"]["provider"],
+            stt_provider=payload["cascaded"]["stt_provider"],
+            tts_provider=payload["cascaded"]["tts_provider"],
+            guild_id=0,
+            channel_id=0,
+            per_channel_record={},
+        )
+
     sub = parts[0]
+
     if sub == "mode" and len(parts) >= 2:
-        return s2s_set_mode({"mode": parts[1]})
+        result = json.loads(s2s_set_mode({"mode": parts[1]}))
+        if "error" in result:
+            return f"❌ {result['error']}"
+        return f"✅ Session mode → {result['session_mode']}"
+
+    if sub == "provider" and len(parts) >= 3:
+        kind, name = parts[1], parts[2]
+        if kind not in {"realtime", "stt", "tts"}:
+            return "Usage: /s2s provider <realtime|stt|tts> <name>"
+        avail = list_registered().get(kind, [])
+        if name not in avail:
+            return (
+                f"❌ Unknown {kind} provider '{name}'. "
+                f"Available: {', '.join(avail)}"
+            )
+        # CLI lacks (guild_id, channel_id) for the per-channel override store,
+        # so we can't persist this the way Discord does. Guide the user to
+        # the global config instead — ADR-0015 acknowledges this as a 0.5.1
+        # follow-up (session-scoped CLI overrides).
+        return (
+            f"⚠️  CLI provider override not yet plumbed (no per-channel context). "
+            f"Edit ~/.hermes/config.yaml: s2s.{kind}.provider: {name}"
+        )
+
     if sub == "test":
-        return s2s_test_pipeline({"text": " ".join(parts[1:]) or None})
-    return (
-        "Usage:\n"
-        "  /s2s [status]              — show current S2S configuration\n"
-        "  /s2s mode <cascaded|realtime|s2s-server> — switch mode for this session\n"
-        "  /s2s test [text]           — smoke-test the configured TTS pipeline"
-    )
+        text = " ".join(parts[1:]) or None
+        result = json.loads(s2s_test_pipeline({"text": text}))
+        if result.get("ok"):
+            return f"✅ TTS OK — wrote {result['bytes']} bytes to {result['wrote']}"
+        return f"❌ failed at {result.get('stage')}: {result.get('error')}"
+
+    if sub == "doctor":
+        # s2s_doctor is async; CLI handlers are sync. If we happen to be
+        # inside an event loop, asyncio.run raises RuntimeError — fall back
+        # to pointing the user at the dedicated `hermes s2s doctor` CLI
+        # subcommand (which has its own async runner).
+        import asyncio
+
+        try:
+            return asyncio.run(s2s_doctor({}))
+        except RuntimeError:
+            return (
+                "Doctor must be called from a sync context. "
+                "Use `hermes s2s doctor` instead."
+            )
+
+    if sub == "reset":
+        # CLI reset = clear the in-memory session mode override.
+        _SESSION_MODE_OVERRIDE.pop("default", None)
+        return "✅ Cleared session override."
+
+    if sub in {"configure", "help"}:
+        from .voice.slash_format import format_help
+
+        return format_help()
+
+    # Unknown subcommand — surface help.
+    from .voice.slash_format import format_help
+
+    return f"Unknown subcommand `{sub}`.\n\n{format_help()}"

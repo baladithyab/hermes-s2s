@@ -33,9 +33,80 @@ from .sessions_cascaded import CascadedSession
 from .sessions_pipeline import CustomPipelineSession
 from .sessions_realtime import RealtimeSession
 from .sessions_s2s_server import S2SServerSession
+from .slash import get_default_store
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# v0.5.0 Wave 1 — per-channel S2SConfig resolution
+# ---------------------------------------------------------------------------
+#
+# The override store evolved from a bare-string mode into a dict-shaped
+# record carrying per-(guild, channel) provider overrides on top of mode.
+# ``resolve_s2s_config_for_channel`` is the single seam every readsite
+# uses to merge that record onto ``load_config()``. Drift between writers
+# (the rich /s2s UI) and readers (this function) is the bug.
+#
+# Pattern mirrors ``_resolve_provider_block`` in
+# ``hermes_s2s._internal.discord_bridge`` — one merge function, every
+# readsite uses it.
+
+
+def resolve_s2s_config_for_channel(
+    *, guild_id: int | None, channel_id: int | None
+) -> Any:
+    """Return a per-channel-resolved :class:`S2SConfig`.
+
+    Loads the global config via :func:`hermes_s2s.config.load_config`,
+    then layers any record from the override store on top using the
+    ``S2SConfig.with_*`` helpers. The cached singleton is never mutated;
+    each call returns a fresh shallow copy.
+
+    Falls back to the global config when:
+
+    - ``guild_id`` or ``channel_id`` is ``None`` (no channel context),
+    - no record exists for ``(guild_id, channel_id)``,
+    - the override store can't be reached (logged + swallowed).
+
+    Notes
+    -----
+    The store is reloaded on every call so a fresh override written by
+    a parallel process (e.g. the slash-command handler in another
+    gateway shard) is honoured without restarting. The cost is one
+    JSON read per voice-join — negligible.
+    """
+    from ..config import load_config
+
+    cfg = load_config()
+    if guild_id is None or channel_id is None:
+        return cfg
+
+    try:
+        store = get_default_store()
+        store.reload()
+        rec = store.get_record(int(guild_id), int(channel_id))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "hermes-s2s factory: override-store lookup failed (%s); "
+            "returning global config",
+            exc,
+        )
+        return cfg
+
+    if not rec:
+        return cfg
+
+    if "mode" in rec:
+        cfg = cfg.with_mode(rec["mode"])
+    if "realtime_provider" in rec:
+        cfg = cfg.with_realtime_provider(rec["realtime_provider"])
+    if "stt_provider" in rec:
+        cfg = cfg.with_stt_provider(rec["stt_provider"])
+    if "tts_provider" in rec:
+        cfg = cfg.with_tts_provider(rec["tts_provider"])
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -401,4 +472,4 @@ class VoiceSessionFactory:
         )
 
 
-__all__ = ["VoiceSessionFactory"]
+__all__ = ["VoiceSessionFactory", "resolve_s2s_config_for_channel"]

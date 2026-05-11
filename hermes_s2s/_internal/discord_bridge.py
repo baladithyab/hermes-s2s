@@ -767,7 +767,19 @@ def _attach_realtime_to_voice_client(
         return
 
     try:
-        cfg = load_config()
+        # v0.5.0 Wave 1: route through resolve_s2s_config_for_channel so any
+        # per-channel provider overrides written via the rich /s2s UI flow
+        # into ``cfg`` here. Mode-only overrides keep working via the
+        # ``channel_overrides`` fold below — same record, two consumers.
+        from ..voice.factory import resolve_s2s_config_for_channel
+
+        _guild = getattr(voice_client, "guild", None)
+        _gid = getattr(_guild, "id", None)
+        _channel = getattr(voice_client, "channel", None)
+        _cid = getattr(_channel, "id", None)
+        cfg = resolve_s2s_config_for_channel(
+            guild_id=_gid, channel_id=_cid
+        )
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning("hermes-s2s: s2s config load failed: %s", exc)
         return
