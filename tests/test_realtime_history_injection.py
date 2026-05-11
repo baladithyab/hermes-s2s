@@ -209,6 +209,133 @@ class TestResolveSessionId:
         assert result == "session-xyz"
 
 
+class TestFindMostRecentThreadSession:
+    """0.4.4 fallback for joining VC from a non-thread channel."""
+
+    def test_returns_none_with_no_session_store(self) -> None:
+        from hermes_s2s._internal.history import (
+            find_most_recent_thread_session_id,
+        )
+
+        adapter = MagicMock(spec=[])
+        result = find_most_recent_thread_session_id(adapter)
+        assert result is None
+
+    def test_returns_none_when_no_thread_sessions_exist(self) -> None:
+        """Only DM/group entries — no thread match."""
+        from hermes_s2s._internal.history import (
+            find_most_recent_thread_session_id,
+        )
+
+        adapter = MagicMock()
+        # No thread keys
+        adapter.session_store._entries = {
+            "agent:main:discord:dm:111": MagicMock(
+                session_id="dm-1", chat_type="dm"
+            ),
+        }
+        result = find_most_recent_thread_session_id(adapter)
+        assert result is None
+
+    def test_picks_most_recent_thread(self) -> None:
+        """Multiple thread sessions — most recent wins."""
+        from hermes_s2s._internal.history import (
+            find_most_recent_thread_session_id,
+        )
+        import datetime as _dt
+
+        now = _dt.datetime.utcnow()
+        adapter = MagicMock()
+        # Three threads at different ages
+        old = MagicMock(
+            session_id="old-thread",
+            chat_type="thread",
+            updated_at=now - _dt.timedelta(hours=10),
+        )
+        recent = MagicMock(
+            session_id="recent-thread",
+            chat_type="thread",
+            updated_at=now - _dt.timedelta(minutes=5),
+        )
+        oldest = MagicMock(
+            session_id="oldest-thread",
+            chat_type="thread",
+            updated_at=now - _dt.timedelta(hours=20),
+        )
+        adapter.session_store._entries = {
+            "agent:main:discord:thread:111:111": old,
+            "agent:main:discord:thread:222:222": recent,
+            "agent:main:discord:thread:333:333": oldest,
+        }
+        result = find_most_recent_thread_session_id(adapter)
+        assert result is not None
+        thread_id, sid = result
+        assert sid == "recent-thread"
+        assert thread_id == 222
+
+    def test_skips_stale_sessions_beyond_max_age(self) -> None:
+        """Sessions older than max_age_hours don't qualify."""
+        from hermes_s2s._internal.history import (
+            find_most_recent_thread_session_id,
+        )
+        import datetime as _dt
+
+        now = _dt.datetime.utcnow()
+        adapter = MagicMock()
+        adapter.session_store._entries = {
+            "agent:main:discord:thread:111:111": MagicMock(
+                session_id="stale",
+                chat_type="thread",
+                updated_at=now - _dt.timedelta(hours=48),
+            ),
+        }
+        result = find_most_recent_thread_session_id(
+            adapter, max_age_hours=24.0
+        )
+        assert result is None
+
+    def test_handles_iso_string_updated_at(self) -> None:
+        """Real SessionEntry serialises updated_at as ISO string."""
+        from hermes_s2s._internal.history import (
+            find_most_recent_thread_session_id,
+        )
+        import datetime as _dt
+
+        now_iso = _dt.datetime.utcnow().isoformat()
+        adapter = MagicMock()
+        adapter.session_store._entries = {
+            "agent:main:discord:thread:111:111": MagicMock(
+                session_id="iso-test",
+                chat_type="thread",
+                updated_at=now_iso,
+            ),
+        }
+        result = find_most_recent_thread_session_id(adapter)
+        assert result is not None
+        assert result[1] == "iso-test"
+
+    def test_filters_non_discord_platforms(self) -> None:
+        """Only discord-platform thread keys are considered."""
+        from hermes_s2s._internal.history import (
+            find_most_recent_thread_session_id,
+        )
+        import datetime as _dt
+
+        now = _dt.datetime.utcnow()
+        adapter = MagicMock()
+        adapter.session_store._entries = {
+            "agent:main:telegram:thread:111:111": MagicMock(
+                session_id="tg-thread",
+                chat_type="thread",
+                updated_at=now,
+            ),
+        }
+        result = find_most_recent_thread_session_id(
+            adapter, platform="discord"
+        )
+        assert result is None
+
+
 # ---------- _BaseRealtimeBackend connect() shim ---------------------- #
 
 

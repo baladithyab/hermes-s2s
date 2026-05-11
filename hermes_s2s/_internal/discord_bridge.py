@@ -877,6 +877,7 @@ def _attach_realtime_to_voice_client(
         from ..config.realtime_config import RealtimeConfig
         from .history import (
             build_history_payload,
+            find_most_recent_thread_session_id,
             get_or_create_adapter_session_db,
             resolve_session_id_for_thread,
         )
@@ -896,21 +897,8 @@ def _attach_realtime_to_voice_client(
                 thread_id = entry.get("thread_id") or entry.get("channel_id")
             elif isinstance(entry, int):
                 thread_id = entry
-            # else: leave thread_id as None — log below
-
-        # If mirror lookup didn't resolve a thread, fall back to the
-        # voice channel id itself — for joins from the home channel
-        # without ThreadResolver creating a thread.
-        if thread_id is None:
-            thread_id = channel_id
-            logger.debug(
-                "hermes-s2s: no transcript mirror thread_id; "
-                "falling back to voice channel id=%s",
-                thread_id,
-            )
 
         # Read the user's history config (typed envelope).
-        # Ignore explosions — defaults are sensible.
         try:
             rt_cfg = RealtimeConfig.from_full_config(
                 {"s2s": {"voice": {"realtime": getattr(cfg, "voice_realtime", {}) or {}}}}
@@ -919,23 +907,50 @@ def _attach_realtime_to_voice_client(
             rt_cfg = RealtimeConfig()
 
         history_payload: list = []
-        if rt_cfg.history.enabled and thread_id is not None:
+        session_id: Optional[str] = None  # for logging
+
+        if rt_cfg.history.enabled:
             session_db = get_or_create_adapter_session_db(adapter)
             if session_db is not None:
-                # NOTE on user_id: the gateway's session-key generator at
-                # gateway/session.py:738-744 honors group_sessions_per_user
-                # which defaults to True — but for Discord threads the
-                # observed live key is "...:thread:<thread_id>:<thread_id>"
-                # (the user_id slot mirrors the thread_id). Pass thread_id
-                # as user_id so resolve_session_id matches the live key.
-                # If a future Hermes version fixes this, our tier-2
-                # _entries lookup will still work because we're matching
-                # whatever generator is actually wired.
-                session_id = resolve_session_id_for_thread(
-                    adapter,
-                    thread_id=int(thread_id),
-                    user_id=int(thread_id),  # see note above
-                )
+                # First try: synthesized lookup from explicit thread_id.
+                # NOTE on user_id: thread keys ignore user_id under
+                # thread_sessions_per_user=False (default), so what we
+                # pass doesn't matter for the lookup. We pass thread_id
+                # for symmetry with the existing key shape.
+                if thread_id is not None:
+                    session_id = resolve_session_id_for_thread(
+                        adapter,
+                        thread_id=int(thread_id),
+                        user_id=int(thread_id),
+                    )
+
+                # 0.4.4 fallback: if the explicit lookup found nothing
+                # (joined VC from a non-thread channel, or no
+                # ThreadResolver match), scan _entries for the most
+                # recently-updated thread session in this platform/guild.
+                # This is the "I was just chatting in another thread,
+                # remember that" UX path — common for users who bounce
+                # between text-thread and voice-channel UI.
+                if session_id is None:
+                    found = find_most_recent_thread_session_id(
+                        adapter,
+                        user_id=None,
+                        guild_id=guild_id,
+                        platform="discord",
+                        max_age_hours=24.0,
+                    )
+                    if found is not None:
+                        thread_id_resolved, session_id = found
+                        if thread_id is None:
+                            thread_id = thread_id_resolved
+                        logger.info(
+                            "hermes-s2s: history fallback — using most "
+                            "recently-updated thread session: "
+                            "thread_id=%s session_id=%s",
+                            thread_id_resolved,
+                            session_id,
+                        )
+
                 if session_id:
                     history_payload = build_history_payload(
                         session_db,
@@ -959,8 +974,8 @@ def _attach_realtime_to_voice_client(
                         )
                 else:
                     logger.info(
-                        "hermes-s2s: no session_id resolved for "
-                        "thread_id=%s — voice will start fresh",
+                        "hermes-s2s: no session_id resolved (thread_id=%s) — "
+                        "voice will start fresh",
                         thread_id,
                     )
 

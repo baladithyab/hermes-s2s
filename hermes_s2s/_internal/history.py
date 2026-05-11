@@ -324,6 +324,102 @@ def resolve_session_id_for_thread(
     return None
 
 
+def find_most_recent_thread_session_id(
+    adapter: Any,
+    *,
+    user_id: Optional[int] = None,
+    guild_id: Optional[int] = None,
+    platform: str = "discord",
+    max_age_hours: float = 24.0,
+) -> Optional[tuple]:
+    """Fallback discovery: find the most recently-updated thread session.
+
+    Used when the user joins voice from a regular channel (not a thread),
+    so ``resolve_session_id_for_thread`` has nothing to look up. We scan
+    ``adapter.session_store._entries`` for the most recent ``thread:``-
+    typed session and assume that's "the thread the user was just chatting
+    in" — usually correct for solo Discord usage where a user threads off
+    the home channel and bounces between voice and text.
+
+    Returns
+    -------
+    (thread_id, session_id) tuple if a candidate is found; ``None`` if
+    no recent thread session exists. Caller can use thread_id for
+    transcript-mirror routing if needed.
+
+    Heuristics
+    ----------
+    - Only thread-typed sessions (``chat_type=="thread"``).
+    - Updated within ``max_age_hours`` (default 24h — beyond that it's
+      probably a stale conversation).
+    - Sorted by updated_at desc; first match wins.
+    - User filter: if ``user_id`` provided, only sessions where the
+      session_key contains that id (group: chats are per-user-isolated).
+      Thread keys don't include user_id (shared per thread), so this
+      filter only kicks in for group sessions — which we skip anyway.
+    """
+    import datetime as _dt
+
+    store = getattr(adapter, "session_store", None)
+    if store is None:
+        return None
+    entries = getattr(store, "_entries", None)
+    if not entries:
+        return None
+
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=max_age_hours)
+
+    candidates = []
+    for key, entry in entries.items():
+        chat_type = getattr(entry, "chat_type", None) or (
+            entry.get("chat_type") if isinstance(entry, dict) else None
+        )
+        if chat_type != "thread":
+            continue
+        # Filter by platform if encoded in key (agent:main:discord:thread:...)
+        if platform and f":{platform}:thread:" not in key:
+            continue
+        updated_at = getattr(entry, "updated_at", None) or (
+            entry.get("updated_at") if isinstance(entry, dict) else None
+        )
+        # updated_at may be a datetime, ISO string, or epoch
+        try:
+            if isinstance(updated_at, str):
+                # Parse ISO; tolerate Z suffix
+                updated_at = _dt.datetime.fromisoformat(
+                    updated_at.replace("Z", "+00:00").split("+")[0]
+                )
+            elif isinstance(updated_at, (int, float)):
+                updated_at = _dt.datetime.utcfromtimestamp(updated_at)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(updated_at, _dt.datetime):
+            continue
+        if updated_at < cutoff:
+            continue
+        sid = getattr(entry, "session_id", None) or (
+            entry.get("session_id") if isinstance(entry, dict) else None
+        )
+        if not sid:
+            continue
+        # Extract thread_id from the session_key; format is
+        # agent:main:discord:thread:<thread_id>:<thread_id>
+        parts = key.split(":")
+        if len(parts) < 5 or parts[3] != "thread":
+            continue
+        try:
+            thread_id_from_key = int(parts[4])
+        except (ValueError, IndexError):
+            continue
+        candidates.append((updated_at, thread_id_from_key, sid))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)  # most recent first
+    _, thread_id_resolved, sid = candidates[0]
+    return (thread_id_resolved, sid)
+
+
 def get_or_create_adapter_session_db(adapter: Any) -> Any:
     """Get the cached ``SessionDB`` instance, constructing on first use.
 
@@ -353,6 +449,7 @@ def get_or_create_adapter_session_db(adapter: Any) -> Any:
 
 __all__ = [
     "build_history_payload",
+    "find_most_recent_thread_session_id",
     "resolve_session_id_for_thread",
     "get_or_create_adapter_session_db",
 ]
