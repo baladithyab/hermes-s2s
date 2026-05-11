@@ -603,3 +603,42 @@ def test_install_creates_group_is_idempotent() -> None:
     assert first is True
     assert second is False
     assert tree.get_command("s2s") is not None
+
+
+# --------------------------------------------------------------------------- #
+# Wave 4 / Task 4.1 — CLI /s2s subcommand router                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_s2s_command_routes_subcommands(tmp_path, monkeypatch):
+    from hermes_s2s.tools import handle_s2s_command
+
+    # No-arg → status
+    out = handle_s2s_command("")
+    assert "active_mode" in out or "Active mode" in out  # JSON or formatted
+
+    # mode set
+    out = handle_s2s_command("mode realtime")
+    assert "realtime" in out
+
+    # provider set (in CLI we don't have guild_id/channel_id — should still work
+    # via a session-scoped path or a clear guidance message)
+    out = handle_s2s_command("provider realtime gpt-realtime-2")
+    # Not great UX without channel ctx; should accept and warn
+    assert (
+        "gpt-realtime-2" in out
+        or "warn" in out.lower()
+        or "global" in out.lower()
+        or "config.yaml" in out.lower()
+    )
+
+    # help
+    out = handle_s2s_command("help")
+    assert "configure" in out and "mode" in out and "provider" in out
+
+
+def test_handle_s2s_command_unknown_subcommand_shows_help():
+    from hermes_s2s.tools import handle_s2s_command
+
+    out = handle_s2s_command("frobnicate")
+    assert "Usage" in out or "configure" in out
