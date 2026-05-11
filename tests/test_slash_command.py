@@ -332,10 +332,31 @@ def test_bridge_folds_store_into_router_channel_overrides(
     monkeypatch.setattr(slash_mod, "_store_singleton", seeded, raising=False)
 
     # Fake cfg object: mode defaults to cascaded.
+    # v0.5.0 Wave 1: ``_attach_realtime_to_voice_client`` now routes through
+    # ``resolve_s2s_config_for_channel`` which calls ``cfg.with_*`` helpers
+    # when the per-channel record has overrides. The fake must expose those
+    # so the bridge keeps progressing to the ModeRouter capture below.
     class FakeCfg:
         mode = "cascaded"
         voice = None
         realtime_provider = None
+
+        def with_mode(self, mode: str) -> "FakeCfg":  # noqa: D401
+            new = FakeCfg()
+            new.mode = mode
+            return new
+
+        def with_realtime_provider(self, p: str) -> "FakeCfg":
+            new = FakeCfg()
+            new.mode = self.mode
+            new.realtime_provider = p
+            return new
+
+        def with_stt_provider(self, p: str) -> "FakeCfg":  # pragma: no cover
+            return self
+
+        def with_tts_provider(self, p: str) -> "FakeCfg":  # pragma: no cover
+            return self
 
     monkeypatch.setattr(
         discord_bridge, "load_config", lambda: FakeCfg(), raising=False
