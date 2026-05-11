@@ -253,6 +253,27 @@ class BridgeBuffer:
 
     # 0.4.2 S1 Fix B helpers ------------------------------------------- #
 
+    def clear_output(self) -> int:
+        """Drop all queued output frames + held remainder. Used on barge-in.
+
+        0.4.2 S3 (audit #21): when the user starts a new utterance,
+        any in-flight ARIA reply is being abandoned. Without this,
+        Discord plays out ~300ms of stale audio (the queued frames)
+        before the new reply starts — perceived as ARIA still talking
+        for a beat after the user interrupts.
+
+        Returns the number of frames dropped (for diagnostics).
+        """
+        with self._output_lock:
+            dropped = len(self._output_frames)
+            self._output_frames.clear()
+            self._output_remainder.clear()
+            self._output_drops += dropped
+            # After a clear, the buffer is logically silent again — so
+            # the next non-silence frame will get faded in (Fix B).
+            self._last_was_silence = True
+        return dropped
+
     def _build_fade_envelope(self) -> None:
         """Precompute raised-cosine fade-in ramp as int16 multipliers (Q15).
 
@@ -592,6 +613,13 @@ class RealtimeAudioBridge:
             s["out_resamplers_cached"] = len(self._out_resampler_cache)
         else:
             s["out_resamplers_cached"] = -1  # soxr unavailable
+        # 0.4.2 audit-#42: surface history injection state so live verify
+        # ("did history actually load?") is objectively checkable via
+        # /s2s_status, not vibes-based.
+        history_injected = bool(getattr(self.backend, "_history_injected", False))
+        s["history_injected"] = history_injected
+        s["realtime_voice"] = getattr(self.backend, "voice", None)
+        s["realtime_model"] = getattr(self.backend, "model", None)
         return s
 
     def _reset_out_resamplers(self) -> None:
@@ -775,6 +803,18 @@ class RealtimeAudioBridge:
                 # next chunk doesn't start with stale FIR taps from the
                 # previous (now-cancelled) reply.
                 self._reset_out_resamplers()
+                # 0.4.2 S3 (audit #21): clear buffered output frames so
+                # the user doesn't hear ~300ms of stale ARIA audio after
+                # interrupting. Fade-in on next non-silence frame keeps
+                # the resumption clean (Fix B already wired).
+                dropped = self.buffer.clear_output()
+                if dropped > 0:
+                    logger.debug(
+                        "barge-in: dropped %d queued output frames "
+                        "(~%dms of stale audio)",
+                        dropped,
+                        dropped * 20,  # 20ms per frame at 48kHz stereo
+                    )
             self._last_input_frame_monotonic = _time.monotonic()
 
             try:

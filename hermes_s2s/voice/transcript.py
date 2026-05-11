@@ -85,8 +85,13 @@ class TranscriptMirror:
         coro = self.send(
             channel_id=channel_id, role=role, text=text, final=final
         )
+        # 0.4.2 audit-#5: ``asyncio.get_event_loop()`` is deprecated in 3.12
+        # (DeprecationWarning) and will raise in 3.14 when called from a
+        # thread without a running loop — exactly our case (player thread).
+        # Use get_running_loop() inside try/except + adapter loop fallback.
+        loop = None
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
 
