@@ -438,6 +438,15 @@ class RealtimeAudioBridge:
         self._closed = False
         self._stop_event: Optional[asyncio.Event] = None
         self._tool_tasks: set[asyncio.Task[Any]] = set()
+        # 0.4.5 P0-1: track in-flight tool tasks by call_id so a Gemini
+        # toolCallCancellation event can cancel the right task and let
+        # _run_and_inject_tool advance the injection sequence pointer
+        # without deadlocking later tools.
+        self._tool_tasks_by_call: dict[str, asyncio.Task[Any]] = {}
+        # Set of call_ids cancelled by the model — _run_and_inject_tool
+        # checks this before injecting and skips inject_tool_result for
+        # cancelled calls (the model has already moved on).
+        self._cancelled_call_ids: set[str] = set()
         # 0.4.2 Manual VAD state — for backends that disable server-side VAD
         # (Gemini Live with automaticActivityDetection.disabled=True). For
         # backends with their own VAD (OpenAI Realtime), the activity_start/
@@ -925,6 +934,35 @@ class RealtimeAudioBridge:
             )
             self._tool_tasks.add(task)
             task.add_done_callback(self._tool_tasks.discard)
+            # 0.4.5 P0-1: index by call_id for cancellation routing.
+            if call_id:
+                self._tool_tasks_by_call[call_id] = task
+                task.add_done_callback(
+                    lambda t, cid=call_id: self._tool_tasks_by_call.pop(cid, None)
+                )
+        elif etype == "tool_cancelled":
+            # 0.4.5 P0-1: Gemini abandoned a tool call. Cancel the in-flight
+            # task and mark the call_id so _run_and_inject_tool's injector
+            # skips inject_tool_result (the model has moved on; injecting
+            # would write into a stale conversation slot). The cancelled
+            # task still advances _tool_seq_next_inject so later tools
+            # don't deadlock waiting on its sequence number.
+            call_id = payload.get("call_id", "")
+            if call_id:
+                self._cancelled_call_ids.add(call_id)
+                task = self._tool_tasks_by_call.get(call_id)
+                if task and not task.done():
+                    logger.info(
+                        "tool_cancelled call_id=%s — cancelling in-flight task",
+                        call_id,
+                    )
+                    task.cancel()
+                else:
+                    logger.debug(
+                        "tool_cancelled call_id=%s — no in-flight task "
+                        "(already finished or unknown)",
+                        call_id,
+                    )
         elif etype == "error":
             logger.warning("backend error event: %r", payload)
         # W3b M3.3 — route realtime transcripts to the optional sink
@@ -976,6 +1014,16 @@ class RealtimeAudioBridge:
             result = await self.tool_bridge.handle_tool_call(
                 self.backend, call_id, name, args
             )
+        except asyncio.CancelledError:
+            # 0.4.5 P0-1: model cancelled the call mid-flight. Advance
+            # the injection pointer so later tools aren't blocked, then
+            # re-raise so the task ends in CANCELLED state.
+            async with self._tool_seq_cond:
+                while self._tool_seq_next_inject != my_seq:
+                    await self._tool_seq_cond.wait()
+                self._tool_seq_next_inject += 1
+                self._tool_seq_cond.notify_all()
+            raise
         except Exception:  # noqa: BLE001
             logger.exception("tool_bridge.handle_tool_call raised")
             # Advance the injection pointer even on failure so later tools
@@ -991,9 +1039,20 @@ class RealtimeAudioBridge:
         async with self._tool_seq_cond:
             while self._tool_seq_next_inject != my_seq:
                 await self._tool_seq_cond.wait()
-            try:
-                await self.backend.inject_tool_result(call_id, result)
-            except Exception:  # noqa: BLE001
-                logger.exception("backend.inject_tool_result raised")
+            # 0.4.5 P0-1: skip inject if the model cancelled this call.
+            # The result is computed but the model has moved on — injecting
+            # would write into a stale conversation slot.
+            if call_id and call_id in self._cancelled_call_ids:
+                logger.debug(
+                    "skipping inject for cancelled call_id=%s "
+                    "(model already moved on)",
+                    call_id,
+                )
+                self._cancelled_call_ids.discard(call_id)
+            else:
+                try:
+                    await self.backend.inject_tool_result(call_id, result)
+                except Exception:  # noqa: BLE001
+                    logger.exception("backend.inject_tool_result raised")
             self._tool_seq_next_inject += 1
             self._tool_seq_cond.notify_all()

@@ -25,6 +25,7 @@ class RealtimeEvent:
         "transcript_partial",
         "transcript_final",
         "tool_call",
+        "tool_cancelled",  # 0.4.5: Gemini toolCallCancellation; advance _tool_seq pointer
         "session_resumed",
         "session_cap",
         "error",

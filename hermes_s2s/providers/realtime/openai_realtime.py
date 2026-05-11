@@ -168,6 +168,13 @@ class OpenAIRealtimeBackend(_BaseRealtimeBackend):
                 "voice": effective_voice,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
+                # 0.4.5 P0-2: enable user-side transcripts. Without this the
+                # Discord thread mirror only shows ARIA's side of the call.
+                # Whisper-1 is the default model on the realtime endpoint;
+                # if the user ever ships a hosted whisper variant we can
+                # plumb a config field. See platform.openai.com/docs/guides/
+                # realtime-conversations#input-audio-transcription.
+                "input_audio_transcription": {"model": "whisper-1"},
                 "tools": opts.tools or [],
                 "tool_choice": "auto",
             },
@@ -200,7 +207,34 @@ class OpenAIRealtimeBackend(_BaseRealtimeBackend):
         Roles map: ``user``→``user`` with ``input_text`` content;
         ``assistant``→``assistant`` with ``text`` content. Other roles
         skipped (filtered upstream by ``build_history_payload``).
+
+        0.4.5 P1-3: prepend a synthetic ``user`` framing turn that names
+        the mode switch ("typed conversation above; voice begins now")
+        so the model has explicit signal that the prior turns were not
+        spoken. Symmetrical with the Gemini path; same wording so the
+        models behave consistently.
         """
+        # 0.4.5 P1-3: framing turn first.
+        await self._send_json(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "(Switching from typed conversation to voice. "
+                                "The conversation above was typed; what follows "
+                                "is spoken. Wait for me to speak before "
+                                "responding.)"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
         for t in history:
             role = t.get("role")
             text = t.get("content")
@@ -310,13 +344,41 @@ class OpenAIRealtimeBackend(_BaseRealtimeBackend):
                 elif mtype == "response.audio_transcript.delta":
                     yield RealtimeEvent(
                         type="transcript_partial",
-                        payload={"text": msg.get("delta", "")},
+                        payload={"text": msg.get("delta", ""), "role": "assistant"},
                     )
 
                 elif mtype == "response.audio_transcript.done":
                     yield RealtimeEvent(
                         type="transcript_final",
-                        payload={"text": msg.get("transcript", "")},
+                        payload={
+                            "text": msg.get("transcript", ""),
+                            "role": "assistant",
+                        },
+                    )
+
+                # 0.4.5 P0-2: user-side transcript events. The server emits
+                # these only when session.update.input_audio_transcription
+                # is set. The .delta variant is currently emitted by the
+                # newer realtime endpoints; older deployments only emit
+                # .completed at end-of-utterance. Handle both for forward-
+                # compat. See platform.openai.com/docs/api-reference/realtime-
+                # server-events.
+                elif mtype == "conversation.item.input_audio_transcription.delta":
+                    yield RealtimeEvent(
+                        type="transcript_partial",
+                        payload={
+                            "text": msg.get("delta", ""),
+                            "role": "user",
+                        },
+                    )
+
+                elif mtype == "conversation.item.input_audio_transcription.completed":
+                    yield RealtimeEvent(
+                        type="transcript_final",
+                        payload={
+                            "text": msg.get("transcript", ""),
+                            "role": "user",
+                        },
                     )
 
                 elif mtype == "response.function_call_arguments.done":

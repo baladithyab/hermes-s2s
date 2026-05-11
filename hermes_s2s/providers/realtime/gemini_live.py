@@ -207,29 +207,61 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
         AFTER setupComplete and BEFORE the first realtimeInput.audio
         frame (the input pump waits on ``_history_injection_complete``).
 
-        If the final turn is ``user``, append a synthetic ``model``
-        closer so Gemini stays silent (UX critique: text "(voice
-        session starting)" doubles as a pacing primer).
+        0.4.5 P1-3: honest mode-transition framing.
+
+        - Prepend a synthetic ``user`` turn naming the mode switch:
+          "(Switching from typed conversation to voice. The conversation
+          above was typed; what follows is spoken. Wait for me to speak
+          before responding.)"
+        - If the final history turn is ``user``, append a synthetic
+          ``model`` turn that acknowledges the mode switch and stays
+          silent: "Voice mode active. Listening." — replaces the older
+          "(voice session starting)" closer (which Gemini sometimes read
+          aloud as if it were a thinking-noise).
+
+        Why both: Gemini's native-audio model reads the final turn as
+        priming; without an assistant-role closer it sometimes greets
+        the user verbally on session-open ("hey what's up?"). With one,
+        it sits silent and waits for audio. Tying the framing to a
+        spoken intro/outro pair (rather than the cryptic parenthetical)
+        improves correctness when the model occasionally DOES decide to
+        verbalize the closer.
         """
         if self._ws is None:
             return
-        gemini_turns: List[Dict[str, Any]] = []
+        gemini_turns: List[Dict[str, Any]] = [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": (
+                            "(Switching from typed conversation to voice. "
+                            "The conversation above was typed; what follows "
+                            "is spoken. Wait for me to speak before "
+                            "responding.)"
+                        )
+                    }
+                ],
+            }
+        ]
         for t in history:
             role = "user" if t.get("role") == "user" else "model"
             text = t.get("content")
             if not isinstance(text, str) or not text.strip():
                 continue
             gemini_turns.append({"role": role, "parts": [{"text": text}]})
-        if not gemini_turns:
+        # Bare history (no real turns survived filtering): drop the lone
+        # framing turn rather than send a single isolated user turn.
+        if len(gemini_turns) == 1:
             return
-        # Ensure final turn is role="model" so Gemini doesn't speak.
-        # Per UX critique §5: "(voice session starting)" reads as natural
-        # language not a keyword, and primes the model for terse voice replies.
+        # Ensure final turn is role="model" so Gemini doesn't speak. The
+        # closer is conversational so it works whether the model stays
+        # silent (preferred) or briefly verbalizes (acceptable degradation).
         if gemini_turns[-1]["role"] == "user":
             gemini_turns.append(
                 {
                     "role": "model",
-                    "parts": [{"text": "(voice session starting)"}],
+                    "parts": [{"text": "Voice mode active. Listening."}],
                 }
             )
         msg = {
@@ -508,7 +540,25 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
             )
             return events
 
-        # goAway, usageMetadata, setupComplete, toolCallCancellation — no events emitted.
+        # 0.4.5 P0-1: surface toolCallCancellation so audio_bridge can cancel
+        # the in-flight _run_and_inject_tool task and advance _tool_seq_next_inject.
+        # Before this fix, a model that abandoned a tool call mid-turn (Gemini
+        # emits this when it decides not to use the result, e.g. user barge-in
+        # or NON_BLOCKING tool race) would deadlock the injection sequence —
+        # later tools could never inject because the cancelled call never
+        # advanced the pointer.
+        cancellation = msg.get("toolCallCancellation")
+        if cancellation:
+            for cancelled_id in cancellation.get("ids", []) or []:
+                events.append(
+                    RealtimeEvent(
+                        type="tool_cancelled",
+                        payload={"call_id": cancelled_id},
+                    )
+                )
+            return events
+
+        # goAway, usageMetadata, setupComplete — no events emitted.
         return events
 
     # ------------------------------------------------------------------ #

@@ -450,14 +450,19 @@ class TestGeminiSendHistory:
         assert "clientContent" in cc
         assert cc["clientContent"]["turnComplete"] is True
         turns = cc["clientContent"]["turns"]
+        # 0.4.5 P1-3: framing turn at index 0, then history, then closer.
+        assert turns[0]["role"] == "user"
+        assert "Switching from typed conversation to voice" in turns[0]["parts"][0]["text"]
+        # History turns: indices 1, 2, 3
+        assert turns[1]["role"] == "user"
+        assert turns[1]["parts"][0]["text"] == "what's the weather"
+        assert turns[2]["role"] == "model"
+        assert turns[2]["parts"][0]["text"] == "sunny and 70"
+        assert turns[3]["role"] == "user"
+        assert turns[3]["parts"][0]["text"] == "thanks"
         # Last turn was user → synthetic model closer appended
         assert turns[-1]["role"] == "model"
-        assert "voice session starting" in turns[-1]["parts"][0]["text"]
-        # User → user, assistant → model role mapping
-        assert turns[0]["role"] == "user"
-        assert turns[0]["parts"][0]["text"] == "what's the weather"
-        assert turns[1]["role"] == "model"
-        assert turns[1]["parts"][0]["text"] == "sunny and 70"
+        assert "Voice mode active" in turns[-1]["parts"][0]["text"]
 
     def test_history_ending_in_assistant_no_synthetic_closer(self) -> None:
         """If history ends in assistant, no closer needed."""
@@ -475,8 +480,10 @@ class TestGeminiSendHistory:
             return ws.sent[0]["clientContent"]["turns"]
 
         turns = asyncio.run(scenario())
-        # 2 input turns, no synthetic closer needed
-        assert len(turns) == 2
+        # 0.4.5 P1-3: framing turn (user) + 2 history turns = 3, no closer.
+        assert len(turns) == 3
+        assert turns[0]["role"] == "user"  # framing
+        assert "typed conversation to voice" in turns[0]["parts"][0]["text"]
         assert turns[-1]["role"] == "model"
         assert turns[-1]["parts"][0]["text"] == "hello"
 
@@ -541,16 +548,19 @@ class TestOpenAISendHistory:
             return ws.sent
 
         sent = asyncio.run(scenario())
-        # 3 turns → 3 conversation.item.create events
-        assert len(sent) == 3
+        # 0.4.5 P1-3: framing turn + 3 history turns = 4 conversation.item.create events
+        assert len(sent) == 4
         for ev in sent:
             assert ev["type"] == "conversation.item.create"
             assert ev["item"]["type"] == "message"
-        # Role + content_type mapping
+        # Framing turn first
         assert sent[0]["item"]["role"] == "user"
-        assert sent[0]["item"]["content"][0]["type"] == "input_text"
-        assert sent[1]["item"]["role"] == "assistant"
-        assert sent[1]["item"]["content"][0]["type"] == "text"
+        assert "typed conversation to voice" in sent[0]["item"]["content"][0]["text"]
+        # Then real history with role + content_type mapping
+        assert sent[1]["item"]["role"] == "user"
+        assert sent[1]["item"]["content"][0]["type"] == "input_text"
+        assert sent[2]["item"]["role"] == "assistant"
+        assert sent[2]["item"]["content"][0]["type"] == "text"
 
     def test_no_response_create_emitted(self) -> None:
         """CRITICAL: must NOT emit response.create or model speaks unprompted."""
@@ -599,7 +609,8 @@ class TestOpenAISendHistory:
             return ws.sent
 
         sent = asyncio.run(scenario())
-        assert len(sent) == 2  # weird role dropped
+        # 0.4.5 P1-3: framing turn + 2 valid history turns = 3 (weird role dropped)
+        assert len(sent) == 3
 
 
 # ---------- ConnectOptions reaches Gemini's tool-disclaimer suffix --- #
