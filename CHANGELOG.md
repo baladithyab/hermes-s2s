@@ -4,6 +4,35 @@ All notable changes to `hermes-s2s` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-05-11
+
+### Fixed
+- **`/s2s configure` (and the rest of the Group's subcommands) now
+  actually appears in Discord's slash autocomplete.** The 0.5.0
+  register-time install path raced against bot login — at
+  `register(ctx)` time, `ctx.runner.adapters["discord"]._client.tree`
+  was None (bot hadn't connected yet), so `install_s2s_command(ctx)`
+  silently no-op'd. The Discord adapter then synced its own slash
+  commands, computed a fingerprint over its own command set (which
+  didn't include `/s2s`), and on subsequent runs refused to re-sync
+  because the fingerprint matched. Result: `/s2s` was on the tree in
+  Python but never published to Discord's UI.
+- New `install_s2s_command_on_adapter(adapter)` helper takes a LIVE
+  `DiscordAdapter` (with `_client.tree` populated) and forces a
+  `tree.sync()` if the tree was already synced — bypassing the
+  fingerprint-skip.
+- The plugin's `register(ctx)` now wires a one-shot
+  `pre_gateway_dispatch` hook that fires the deferred install on the
+  first inbound message (when the gateway and Discord adapter are
+  guaranteed live).
+- The `_install_bridge_on_adapter` path also calls the new helper as
+  belt-and-suspenders, so even users who don't trigger
+  `pre_gateway_dispatch` get the slash on first `/voice join`.
+
+### Tests
+- 365 passed (was 363 → +2). New tests cover the live-tree adapter
+  install path and the no-client/no-tree fallbacks.
+
 ## [0.5.0] — 2026-05-11
 
 ### Added
