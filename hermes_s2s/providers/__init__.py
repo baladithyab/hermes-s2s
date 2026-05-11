@@ -46,7 +46,15 @@ def register_builtin_realtime_providers() -> None:
         logger.debug("gemini-live realtime not registered: %s", exc)
     try:
         from .realtime.openai_realtime import make_openai_realtime
+        # Register multiple aliases — users may set any of these as
+        # ``s2s.realtime.provider``. The factory passes the resolved
+        # config sub-block (which contains the actual ``model`` field)
+        # into the OpenAI backend, so the alias choice doesn't pin
+        # the model — it just routes to the same factory.
+        register_realtime("openai-realtime", make_openai_realtime)
         register_realtime("gpt-realtime", make_openai_realtime)
+        register_realtime("gpt-realtime-1.5", make_openai_realtime)
+        register_realtime("gpt-realtime-2", make_openai_realtime)
         register_realtime("gpt-realtime-mini", make_openai_realtime)
     except Exception as exc:
         logger.debug("openai realtime not registered: %s", exc)

@@ -182,6 +182,32 @@ def _extract_text(content: Any) -> str:
 # --- Session-id resolution: 4-tier fallback cascade ----------------- #
 
 
+def _get_session_store(adapter: Any) -> Any:
+    """Resolve the live SessionStore from an adapter.
+
+    The Discord adapter doesn't own a SessionStore directly — the gateway
+    runner does. ``adapter.gateway_runner.session_store`` is the live
+    runtime path; ``adapter.session_store`` (legacy) is checked first
+    in case future Hermes versions expose it directly. Returns None if
+    neither route resolves.
+
+    Verified 2026-05-11 via live-runtime probe: v0.4.4 fallback failed
+    silently because ``adapter.session_store`` doesn't exist; the store
+    only lives on the gateway runner. Both ``resolve_session_id_for_thread``
+    and ``find_most_recent_thread_session_id`` now route through this
+    helper.
+    """
+    direct = getattr(adapter, "session_store", None)
+    if direct is not None:
+        return direct
+    runner = getattr(adapter, "gateway_runner", None)
+    if runner is not None:
+        runner_store = getattr(runner, "session_store", None)
+        if runner_store is not None:
+            return runner_store
+    return None
+
+
 def resolve_session_id_for_thread(
     adapter: Any,
     *,
@@ -232,10 +258,11 @@ def resolve_session_id_for_thread(
     str | None
         Session id if resolved, else None.
     """
-    store = getattr(adapter, "session_store", None)
+    store = _get_session_store(adapter)
     if store is None:
         logger.debug(
-            "resolve_session_id_for_thread: adapter has no session_store"
+            "resolve_session_id_for_thread: adapter has no session_store "
+            "(neither direct nor via gateway_runner)"
         )
         return None
 
@@ -360,9 +387,18 @@ def find_most_recent_thread_session_id(
     """
     import datetime as _dt
 
-    store = getattr(adapter, "session_store", None)
+    store = _get_session_store(adapter)
     if store is None:
         return None
+    # Force lazy load — SessionStore loads sessions.json on first access.
+    if hasattr(store, "_ensure_loaded"):
+        try:
+            store._ensure_loaded()  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "find_most_recent_thread_session_id: _ensure_loaded raised",
+                exc_info=True,
+            )
     entries = getattr(store, "_entries", None)
     if not entries:
         return None

@@ -1135,13 +1135,46 @@ def _attach_realtime_to_voice_client(
         bridges[guild_id] = bridge
 
     # (h) Silence Hermes core's cascaded voice loop while realtime is active.
-    # Hermes core wires:
-    #   adapter._voice_input_callback = self._handle_voice_channel_input
-    # which fires faster-whisper STT every time the VoiceReceiver flushes a
-    # speech buffer, then injects the transcript as a text turn — duplicating
-    # what our realtime backend is already doing, and on this user's GPU
-    # spamming "cuBLAS failed" errors. Stash the original and replace with a
-    # no-op for the lifetime of this bridge; restored in leave_voice_channel.
+    # 0.4.6: previously we monkey-patched only ``adapter._voice_input_callback``,
+    # but the cuBLAS-spamming faster-whisper run sits UPSTREAM of that callback
+    # in ``adapter._process_voice_input`` (gateway/platforms/discord.py:2121),
+    # which fires ``transcribe_audio`` (line 2132) BEFORE the callback gate.
+    # Result: even with a silenced callback, every silence-detected utterance
+    # still ran the GPU transcription and burned cuBLAS error logs while our
+    # realtime backend was the actual audio path. Now we silence
+    # ``_process_voice_input`` itself — a no-op coroutine for the lifetime of
+    # the realtime bridge. Restored in leave_voice_channel.
+    try:
+        prev_process_input = getattr(adapter, "_process_voice_input", None)
+        if (
+            prev_process_input is not None
+            and not getattr(prev_process_input, "_s2s_silenced", False)
+        ):
+            async def _s2s_silenced_process_input(_self_unused, *_args, **_kwargs):
+                """No-op: realtime backend handles this user's audio directly."""
+                return None
+            # Bound-method shim — discord adapter calls ``self._process_voice_input(...)``
+            # so we need to bind the no-op as a method on the instance.
+            import types as _types
+            bound_noop = _types.MethodType(
+                _s2s_silenced_process_input, adapter
+            )
+            bound_noop._s2s_silenced = True  # type: ignore[attr-defined]
+            bound_noop._s2s_prev = prev_process_input  # type: ignore[attr-defined]
+            adapter._process_voice_input = bound_noop
+            logger.info(
+                "hermes-s2s: silenced cascaded _process_voice_input "
+                "(was %s); realtime backend owns audio + transcription now",
+                getattr(prev_process_input, "__qualname__", repr(prev_process_input)),
+            )
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning(
+            "hermes-s2s: could not silence _process_voice_input: %s", exc
+        )
+
+    # Legacy: also silence the callback in case some Hermes version reaches
+    # it via a different code path. Idempotent + harmless if the upstream
+    # silencing above already prevents it from being invoked.
     try:
         prev_input_cb = getattr(adapter, "_voice_input_callback", None)
         if prev_input_cb is not None and not getattr(prev_input_cb, "_s2s_silenced", False):
@@ -1426,6 +1459,7 @@ def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
         # Restore Hermes core's silenced cascaded callback (mirror of step (i)
         # in _attach_realtime_to_voice_client). If the user re-joins in
         # cascaded mode after this, the original STT path takes over again.
+        # 0.4.6: also restore the upstream _process_voice_input shim.
         try:
             cb = getattr(self, "_voice_input_callback", None)
             prev = getattr(cb, "_s2s_prev", None)
@@ -1436,6 +1470,18 @@ def _wrap_leave_voice_channel(DiscordAdapter: Any) -> None:
                 )
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("hermes-s2s: restore _voice_input_callback failed: %s", exc)
+        try:
+            pi = getattr(self, "_process_voice_input", None)
+            prev_pi = getattr(pi, "_s2s_prev", None)
+            if pi is not None and getattr(pi, "_s2s_silenced", False) and prev_pi is not None:
+                self._process_voice_input = prev_pi
+                logger.info(
+                    "hermes-s2s: restored _process_voice_input (was silenced)"
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(
+                "hermes-s2s: restore _process_voice_input failed: %s", exc
+            )
 
         # Restore the original socket listener on the VoiceReceiver. We swapped
         # it during _install_frame_callback; if we leave the wrapper in place

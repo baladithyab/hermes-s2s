@@ -4,6 +4,9 @@ Coverage:
 - P0-1: Gemini toolCallCancellation event surfacing + audio_bridge cancel
 - P0-2: OpenAI input_audio_transcription session config + user transcript routing
 - P1-3: Honest history framing turn (typed→voice transition)
+- v0.4.6: provider alias coverage (openai-realtime, gpt-realtime-2, gpt-realtime-1.5)
+- v0.4.6: history-fallback resolves SessionStore via gateway_runner indirection
+- v0.4.6: cascaded STT silencer covers _process_voice_input (not just callback)
 """
 
 from __future__ import annotations
