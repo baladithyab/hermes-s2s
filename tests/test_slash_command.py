@@ -43,9 +43,10 @@ def test_store_get_set(tmp_path: Path) -> None:
     assert store.get(111, 222) == "realtime"
 
     # The file must exist on disk with the merged payload.
+    # v0.5.0 (Wave 1): on-disk values are dict-shaped, not bare strings.
     assert store_path.exists()
     data = json.loads(store_path.read_text())
-    assert data["111:222"] == "realtime"
+    assert data["111:222"] == {"mode": "realtime"}
 
     # clear() removes the entry.
     store.clear(111, 222)
@@ -186,10 +187,13 @@ def test_concurrent_writes_dont_corrupt(tmp_path: Path) -> None:
     assert isinstance(data, dict)
 
     # All 10 writes present.
+    # v0.5.0 (Wave 1): each on-disk value is a dict, not a bare string.
     for cid, mode in writes:
         key = f"42:{cid}"
         assert key in data, f"missing {key} in {list(data)}"
-        assert data[key] == mode, f"expected {mode} at {key}, got {data[key]}"
+        assert data[key] == {"mode": mode}, (
+            f"expected {{'mode': {mode!r}}} at {key}, got {data[key]}"
+        )
 
     # Fresh store reads the same thing back.
     fresh = S2SModeOverrideStore(path=store_path)
@@ -384,3 +388,36 @@ def test_bridge_folds_store_into_router_channel_overrides(
     ) == "realtime", (
         f"expected channel_overrides[2002]='realtime', got {channel_overrides!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Wave 1 / 0.5.0 — dict-shaped record API                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_get_record_returns_dict_for_new_entries(tmp_path: Path) -> None:
+    """0.5.0: set_record / get_record round-trip a dict-shaped record."""
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    store.set_record(123, 456, {"mode": "realtime", "realtime_provider": "gpt-realtime-2"})
+    rec = store.get_record(123, 456)
+    assert rec == {"mode": "realtime", "realtime_provider": "gpt-realtime-2"}
+
+
+def test_get_record_lifts_legacy_string(tmp_path: Path) -> None:
+    """Pre-0.5.0 entries on disk are bare strings; new readers must lift them
+    losslessly into ``{"mode": <str>}``.
+    """
+    p = tmp_path / "ovr.json"
+    p.write_text(json.dumps({"123:456": "cascaded"}), encoding="utf-8")
+    store = S2SModeOverrideStore(path=p)
+    rec = store.get_record(123, 456)
+    assert rec == {"mode": "cascaded"}
+
+
+def test_legacy_get_method_still_works_after_dict_upgrade(tmp_path: Path) -> None:
+    """Existing factory.py call sites using ``.get()`` must continue to return
+    the mode string unchanged after the schema migration.
+    """
+    store = S2SModeOverrideStore(path=tmp_path / "ovr.json")
+    store.set_record(123, 456, {"mode": "s2s-server", "stt_provider": "groq"})
+    assert store.get(123, 456) == "s2s-server"

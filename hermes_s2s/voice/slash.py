@@ -1,4 +1,4 @@
-"""Plugin-owned Discord ``/s2s`` slash command + per-channel mode override store.
+"""Plugin-owned Discord ``/s2s`` slash command + per-channel override store.
 
 Implements WAVE 2a / M2.1 of the 0.4.0 re-architecture (Discord-only; Telegram
 and CLI scopes deferred to 0.4.1). See:
@@ -7,12 +7,20 @@ and CLI scopes deferred to 0.4.1). See:
 - docs/research/13-mode-ux-deep-dive.md §4 (the exact command pattern)
 - docs/plans/wave-0.4.0-rearchitecture.md WAVE 2a (A3 cross-process + A4 flock
   acceptance criteria)
+- docs/adrs/0015-s2s-configure-rich-ui.md + docs/plans/wave-0.5.0-s2s-configure.md
+  (Wave 1 — schema migration from bare-string mode to dict-shaped record).
 
-The store persists to ``<HERMES_HOME>/.s2s_mode_overrides.json`` as a flat
-``{"guild_id:channel_id": mode_value}`` map. Writes go through a
-temp-file+atomic-rename path with an ``fcntl.flock(LOCK_EX)`` wrapper so
-concurrent writes from multiple processes (or many threads in one process)
-can't corrupt the file — Phase-8 security P1-F8.
+The store persists to ``<HERMES_HOME>/.s2s_mode_overrides.json``. As of v0.5.0
+(Wave 1) each entry is a JSON object — ``{"mode": "...", "realtime_provider":
+"...", "stt_provider": "...", "tts_provider": "..."}`` — so per-channel overrides
+can carry provider keys alongside the mode. Pre-0.5.0 bare-string values are
+lifted on read into ``{"mode": <str>}`` losslessly; the legacy ``set``/``get``
+methods are kept as thin shims so existing factory call sites keep working.
+
+Writes go through a temp-file+atomic-rename path with an
+``fcntl.flock(LOCK_EX)`` wrapper so concurrent writes from multiple processes
+(or many threads in one process) can't corrupt the file — Phase-8 security
+P1-F8.
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ import os
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from .modes import VoiceMode
 
@@ -63,16 +71,38 @@ def _default_store_path() -> Path:
         return Path(home) / _OVERRIDES_FILENAME
 
 
+def _coerce_value(v: Any) -> Dict[str, str]:
+    """Lift any on-disk entry into the canonical dict-shape.
+
+    - Pre-0.5.0 entries on disk are bare strings — lift to ``{"mode": <str>}``.
+    - 0.5.0+ entries are dicts — coerce keys/values to strings, drop empties.
+    - Anything else (None, lists, numbers) collapses to the empty dict so a
+      corrupted file doesn't crash the loader.
+    """
+    if isinstance(v, str):
+        return {"mode": v}
+    if isinstance(v, dict):
+        return {str(k): str(val) for k, val in v.items() if val is not None and str(val) != ""}
+    return {}
+
+
 class S2SModeOverrideStore:
-    """Persistent per-(guild_id, channel_id) voice-mode override store.
+    """Persistent per-(guild_id, channel_id) S2S override store.
 
     The store is deliberately simple: a JSON file on disk, lazy-loaded on
-    first access, flushed atomically after every ``set``/``clear`` with
-    an OS-level exclusive file lock. The in-memory cache is refreshed
-    on demand via :meth:`reload` — callers that need cross-process
-    consistency should call :meth:`reload` before :meth:`get` in hot
-    paths (the voice-join flow does this once per join — cost is
-    negligible).
+    first access, flushed atomically after every ``set``/``set_record``/
+    ``patch_record``/``clear`` with an OS-level exclusive file lock. The
+    in-memory cache is refreshed on demand via :meth:`reload` — callers
+    that need cross-process consistency should call :meth:`reload` before
+    :meth:`get` in hot paths (the voice-join flow does this once per join
+    — cost is negligible).
+
+    Schema (v0.5.0+)
+    ----------------
+    Each entry is a dict ``{"mode": "...", "realtime_provider": "...",
+    "stt_provider": "...", "tts_provider": "..."}``. All keys are optional;
+    missing keys mean "fall through to the global config". Pre-0.5.0
+    bare-string entries are lifted on read into ``{"mode": <str>}``.
     """
 
     def __init__(self, path: Optional[Path] = None) -> None:
@@ -80,7 +110,8 @@ class S2SModeOverrideStore:
         # In-process lock guards the cache dict + the file-writing section.
         # File-level locking (flock) is additive, for cross-process safety.
         self._lock = threading.Lock()
-        self._cache: dict[str, str] = {}
+        # v0.5.0: cache value is now a dict-shaped record, not a bare string.
+        self._cache: Dict[str, Dict[str, str]] = {}
         self._loaded = False
 
     # --- helpers --------------------------------------------------------
@@ -95,15 +126,21 @@ class S2SModeOverrideStore:
         self._load_locked()
 
     def _load_locked(self) -> None:
-        """Populate ``self._cache`` from disk; tolerate missing/corrupt file."""
+        """Populate ``self._cache`` from disk; tolerate missing/corrupt file.
+
+        Each value is fed through :func:`_coerce_value` so legacy bare-string
+        entries are lifted into the dict-shape on read.
+        """
         try:
             with self._path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if isinstance(data, dict):
-                # Coerce all values to strings; drop any non-dict entries.
-                self._cache = {
-                    str(k): str(v) for k, v in data.items() if v is not None
-                }
+                cache: Dict[str, Dict[str, str]] = {}
+                for k, v in data.items():
+                    rec = _coerce_value(v)
+                    if rec:
+                        cache[str(k)] = rec
+                self._cache = cache
             else:
                 logger.warning(
                     "hermes-s2s: override store at %s is not a dict; ignoring",
@@ -128,30 +165,82 @@ class S2SModeOverrideStore:
             self._loaded = False
             self._load_locked()
 
-    # --- public API -----------------------------------------------------
+    # --- public API: rich (v0.5.0+) ------------------------------------
 
-    def get(self, guild_id: int, channel_id: int) -> str | None:
+    def get_record(self, guild_id: int, channel_id: int) -> Dict[str, str]:
+        """Return the full per-channel record (or an empty dict if absent)."""
         with self._lock:
             self._ensure_loaded()
-            return self._cache.get(self._key(guild_id, channel_id))
+            return dict(self._cache.get(self._key(guild_id, channel_id), {}))
+
+    def set_record(
+        self, guild_id: int, channel_id: int, record: Dict[str, str]
+    ) -> None:
+        """Replace the entire record for ``(guild_id, channel_id)``.
+
+        Empty/None record clears the entry. The ``mode`` key, if present,
+        is normalized via :meth:`VoiceMode.normalize` so aliases land on
+        disk as canonical values; an unparseable mode is dropped (other
+        keys preserved) rather than failing the write.
+        """
+        cleaned = {
+            str(k): str(v) for k, v in (record or {}).items() if v not in (None, "")
+        }
+        if "mode" in cleaned:
+            try:
+                cleaned["mode"] = VoiceMode.normalize(cleaned["mode"]).value
+            except ValueError:
+                cleaned.pop("mode", None)
+        with self._lock:
+            self._ensure_loaded()
+            merged = dict(self._cache)
+            if cleaned:
+                merged[self._key(guild_id, channel_id)] = cleaned
+            else:
+                merged.pop(self._key(guild_id, channel_id), None)
+            self._write_atomic(merged)
+            self._cache = merged
+
+    def patch_record(
+        self, guild_id: int, channel_id: int, **fields: str
+    ) -> Dict[str, str]:
+        """Merge ``fields`` into the existing record; return the new record."""
+        with self._lock:
+            self._ensure_loaded()
+            existing = dict(self._cache.get(self._key(guild_id, channel_id), {}))
+        cleaned = {k: v for k, v in fields.items() if v not in (None, "")}
+        if "mode" in cleaned:
+            try:
+                cleaned["mode"] = VoiceMode.normalize(cleaned["mode"]).value
+            except ValueError:
+                cleaned.pop("mode", None)
+        existing.update({str(k): str(v) for k, v in cleaned.items()})
+        self.set_record(guild_id, channel_id, existing)
+        return existing
+
+    # --- public API: back-compat shims (legacy mode-only callers) ------
+
+    def get(self, guild_id: int, channel_id: int) -> str | None:
+        """Return the stored mode string, or ``None`` if no override.
+
+        Back-compat shim around :meth:`get_record` for pre-0.5.0 callers
+        that only care about the mode field.
+        """
+        rec = self.get_record(guild_id, channel_id)
+        return rec.get("mode") if rec else None
 
     def set(self, guild_id: int, channel_id: int, mode: str) -> None:
         """Persist ``mode`` for ``(guild_id, channel_id)``.
 
-        ``mode`` is normalized via :meth:`VoiceMode.normalize` so aliases
-        like ``"s2s_server"`` land on disk as canonical ``"s2s-server"``.
+        Back-compat shim that patches only the ``mode`` field, preserving
+        any provider keys an existing record may have. ``mode`` is
+        normalized via :meth:`VoiceMode.normalize` so aliases like
+        ``"s2s_server"`` land on disk as canonical ``"s2s-server"``.
         """
-        canonical = VoiceMode.normalize(mode).value
-        with self._lock:
-            self._ensure_loaded()
-            # Re-read from disk under flock so we don't clobber a write
-            # from a concurrent process between our load and our write.
-            merged = dict(self._cache)
-            merged[self._key(guild_id, channel_id)] = canonical
-            self._write_atomic(merged)
-            self._cache = merged
+        self.patch_record(guild_id, channel_id, mode=mode)
 
     def clear(self, guild_id: int, channel_id: int) -> None:
+        """Remove the entire per-channel record."""
         with self._lock:
             self._ensure_loaded()
             merged = dict(self._cache)
@@ -161,7 +250,7 @@ class S2SModeOverrideStore:
 
     # --- atomic, flock-protected write ---------------------------------
 
-    def _write_atomic(self, payload: dict[str, str]) -> None:
+    def _write_atomic(self, payload: Dict[str, Dict[str, str]]) -> None:
         """Serialize ``payload`` → temp → fsync → os.replace, under flock.
 
         Strategy:
@@ -176,6 +265,12 @@ class S2SModeOverrideStore:
            directory, ``flush()`` + ``fsync()``, then ``os.replace``
            over the real path (atomic on POSIX + modern NTFS).
         5. Release the flock.
+
+        v0.5.0: payload values are dict-shaped. Legacy bare-string entries
+        encountered on disk during the merge are lifted via
+        :func:`_coerce_value` so a parallel writer running an older
+        version doesn't get its data dropped — though once we write back,
+        the file is in the new shape.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -189,14 +284,15 @@ class S2SModeOverrideStore:
                 # Merge with whatever is on disk right now (another process
                 # may have written between our last cache load and this
                 # write). We still keep our just-set entries on top.
-                disk: dict[str, str] = {}
+                disk: Dict[str, Dict[str, str]] = {}
                 try:
                     with self._path.open("r", encoding="utf-8") as fh:
                         loaded = json.load(fh)
                     if isinstance(loaded, dict):
-                        disk = {
-                            str(k): str(v) for k, v in loaded.items() if v is not None
-                        }
+                        for k, v in loaded.items():
+                            rec = _coerce_value(v)
+                            if rec:
+                                disk[str(k)] = rec
                 except (FileNotFoundError, OSError, json.JSONDecodeError):
                     disk = {}
                 # Our in-memory payload wins per key (we want set/clear
