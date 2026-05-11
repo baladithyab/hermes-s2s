@@ -234,7 +234,18 @@ class OpenAIRealtimeBackend(_BaseRealtimeBackend):
         Resampling uses ``hermes_s2s.audio.resample`` (R1). If the module is
         not yet available and the caller supplies a non-24 kHz rate we raise
         with a helpful message.
+
+        0.4.2 S2 (red-team P0-7): if history injection is in flight,
+        block here until ``_history_injection_complete`` so live audio
+        doesn't interleave into the conversation.item.create sequence
+        and corrupt server-side conversation state.
         """
+        # Gate live audio behind history-injection completion. Event is
+        # set immediately on connect() if no history; only gates on the
+        # first chunk of a fresh session with non-empty history.
+        if self._history_injection_complete is not None:
+            await self._history_injection_complete.wait()
+
         if self._ws is None:
             raise RuntimeError("OpenAIRealtimeBackend: not connected")
 

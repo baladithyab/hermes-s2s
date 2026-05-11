@@ -346,7 +346,20 @@ class GeminiLiveBackend(_BaseRealtimeBackend):
     # send / recv                                                        #
     # ------------------------------------------------------------------ #
     async def send_audio_chunk(self, pcm_chunk: bytes, sample_rate: int) -> None:
-        """Send a PCM audio chunk. Resamples to 16kHz s16le mono if needed."""
+        """Send a PCM audio chunk. Resamples to 16kHz s16le mono if needed.
+
+        0.4.2 S2 (red-team P0-7): if history injection is in flight,
+        block here until ``_history_injection_complete`` so live audio
+        frames don't interleave into the clientContent.turns sequence
+        and trigger an unprompted Gemini response before the synthetic
+        model closer is sent.
+        """
+        # Gate live audio behind history-injection completion. Event is
+        # set immediately on connect() if no history; only gates on the
+        # first chunk of a fresh session with non-empty history.
+        if self._history_injection_complete is not None:
+            await self._history_injection_complete.wait()
+
         if self._ws is None:
             raise RuntimeError(f"{self.NAME}: not connected")
 

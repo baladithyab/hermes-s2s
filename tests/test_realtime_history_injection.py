@@ -496,3 +496,97 @@ class TestPersonaSuffix:
         prompt = setup["systemInstruction"]["parts"][0]["text"]
         assert "cannot call tools" in prompt
         assert "completed work" in prompt
+
+
+# ---------- send_audio_chunk gates on history-injection event ------- #
+
+
+class TestSendAudioGating:
+    """Pre-merge review caught: _history_injection_complete was set in
+    connect() but NEVER awaited in send_audio_chunk. Live audio would
+    interleave into history sequence corrupting server state.
+
+    These tests fence that send_audio_chunk waits on the event.
+    """
+
+    def test_gemini_send_audio_blocks_until_history_complete(self) -> None:
+        from hermes_s2s.providers.realtime.gemini_live import GeminiLiveBackend
+
+        async def scenario():
+            backend = GeminiLiveBackend(
+                api_key_env="X", url="ws://x", model="m"
+            )
+            # Set up: gating event present but NOT set (history mid-injection)
+            backend._history_injection_complete = asyncio.Event()
+            ws = _RecordingWS()
+            backend._ws = ws
+
+            # Fire send_audio_chunk; should NOT complete (blocked on event)
+            send_task = asyncio.create_task(
+                backend.send_audio_chunk(b"\x00\x00" * 1000, 16000)
+            )
+
+            # Give it a tick — must still be pending
+            await asyncio.sleep(0.05)
+            assert not send_task.done(), (
+                "send_audio_chunk should block on _history_injection_complete"
+            )
+
+            # Now set the event — task should complete
+            backend._history_injection_complete.set()
+            await asyncio.wait_for(send_task, timeout=1.0)
+            assert send_task.done()
+            # Verify the audio frame was actually sent post-gate.
+            sent_types = [s.get("realtimeInput", {}) for s in ws.sent]
+            assert any("mediaChunks" in t or "audio" in t for t in sent_types)
+
+        asyncio.run(scenario())
+
+    def test_openai_send_audio_blocks_until_history_complete(self) -> None:
+        from hermes_s2s.providers.realtime.openai_realtime import (
+            OpenAIRealtimeBackend,
+        )
+
+        async def scenario():
+            backend = OpenAIRealtimeBackend(
+                api_key_env="X", connect_url="ws://x", model="m"
+            )
+            backend._history_injection_complete = asyncio.Event()
+            ws = _RecordingWS()
+            backend._ws = ws
+            backend._send_lock = asyncio.Lock()
+
+            send_task = asyncio.create_task(
+                backend.send_audio_chunk(b"\x00\x00" * 1000, 24000)
+            )
+
+            await asyncio.sleep(0.05)
+            assert not send_task.done(), (
+                "send_audio_chunk should block on _history_injection_complete"
+            )
+
+            backend._history_injection_complete.set()
+            await asyncio.wait_for(send_task, timeout=1.0)
+            assert send_task.done()
+            # Verify input_audio_buffer.append was sent post-gate.
+            sent_types = [s.get("type") for s in ws.sent]
+            assert "input_audio_buffer.append" in sent_types
+
+        asyncio.run(scenario())
+
+    def test_send_audio_no_gate_when_event_is_none(self) -> None:
+        """If event is None (legacy / not initialized), don't block."""
+        from hermes_s2s.providers.realtime.gemini_live import GeminiLiveBackend
+
+        async def scenario():
+            backend = GeminiLiveBackend(api_key_env="X", url="ws://x", model="m")
+            backend._history_injection_complete = None
+            ws = _RecordingWS()
+            backend._ws = ws
+            # Should complete immediately (no gate)
+            await asyncio.wait_for(
+                backend.send_audio_chunk(b"\x00\x00" * 1000, 16000),
+                timeout=1.0,
+            )
+
+        asyncio.run(scenario())
